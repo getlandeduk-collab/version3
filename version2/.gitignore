@@ -1,0 +1,62 @@
+.venv/
+venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.pyc
+
+# Environment & secrets
+.env
+.env.*
+.python-version
+serviceAccountKey.json
+
+# Logs & coverage
+logs/
+*.log
+coverage/
+.coverage
+.coverage.*
+.pytest_cache/
+
+# Editors & tooling
+.DS_Store
+.idea/
+.vscode/
+
+# Node / frontend
+node_modules/
+npm-debug.log*
+package-lock.json
+yarn.lock
+Frontend/
+frontend/
+
+# Documentation files
+*.md
+md/
+
+# Test files
+test_py/
+test_*.py
+*_test.py
+
+# Response files
+responses/
+
+# TypeScript files
+*.ts
+*.tsx
+
+# Frontend archives
+Frontend.zip
+frontend.zip
