@@ -63,7 +63,17 @@ class CandidateProfile(BaseModel):
     phone: Optional[str] = None
     skills: List[str] = Field(default_factory=list)
     experience_summary: Optional[str] = None
-    total_years_experience: Optional[float] = None
+    experience_breakdown: Optional[Dict[str, str]] = Field(
+        default_factory=lambda: {
+            "full_time": "0 months",
+            "internship": "0 months",
+            "freelance": "0 months",
+            "part_time": "0 months",
+            "contract": "0 months",
+            "academic": "0 months",
+            "total": "0 months"
+        }
+    )
     interests: List[str] = Field(default_factory=list)
     education: List[Dict[str, Any]] = Field(default_factory=list)
     certifications: List[str] = Field(default_factory=list)

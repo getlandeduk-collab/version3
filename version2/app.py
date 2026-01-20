@@ -55,6 +55,12 @@ from utils import (
     now_iso,
     make_request_id,
 )
+from experience_parser import (
+    calculate_experience_breakdown,
+    parse_date_range,
+    classify_experience_type,
+    parse_duration_string,
+)
 
 from pyngrok import ngrok, conf as ngrok_conf
 
@@ -1352,6 +1358,21 @@ async def match_jobs_stream(
             resume_text = extract_text_from_pdf_bytes(resume_bytes)
             logger.info(f"Resume text extracted, length: {len(resume_text)}")
             
+            # Save OCR-extracted text to separate file for debugging
+            ocr_text_file_path = Path(f"responses/resume_ocr_{request_id}.txt")
+            ocr_text_file_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(ocr_text_file_path, "w", encoding="utf-8") as ocr_file:
+                    ocr_file.write("=== OCR-EXTRACTED RESUME TEXT ===\n")
+                    ocr_file.write(f"Request ID: {request_id}\n")
+                    ocr_file.write(f"Extracted: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    ocr_file.write(f"Text Length: {len(resume_text)} characters\n")
+                    ocr_file.write(f"{'='*60}\n\n")
+                    ocr_file.write(resume_text)
+                logger.info(f"OCR-extracted resume text saved to: {ocr_text_file_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save OCR text to file: {e}")
+            
             model_name = settings.model_name or "gpt-4o-mini"
             logger.info(f"Starting streaming LLM parsing with model: {model_name}")
             
@@ -1369,28 +1390,56 @@ RESUME TEXT (OCR-extracted from PDF):
 
 CRITICAL EXTRACTION RULES:
 
-1. **experience_summary** (MOST IMPORTANT - READ CAREFULLY):
-   - Read through the resume text and identify ALL sections that describe practical work/experience:
-     * Work Experience / Professional Experience / Employment sections
-     * Internship sections
-     * Projects sections (personal projects, team projects, hackathons)
-     * Research work
-     * Achievements that involve building/creating something
-   - Extract the ACTUAL CONTENT from these sections - what they did, what they built, key achievements
-   - Write a 2-3 sentence summary that combines ALL this experience
-   - DO NOT include: school names, education details, certifications, personal info, or random text
-   - DO NOT make up experience - only use what's actually written in the resume
-   - Example format: "Built [project name] using [technologies]. Worked as [role] at [company/org] where [achievement]. Participated in [hackathon/project] achieving [result]."
-   - If you see sections like "Voice Sales Assistant", "RAG-based decision support", "deepfake detection", etc. - these are projects/experience, include them
-   - If you see "SRI KRISHNA COLLEGE OF" or similar - this is EDUCATION, NOT experience - DO NOT include it
+1. **experience_summary** (MOST IMPORTANT - OVERALL PROFILE SUMMARY):
+   - This should be a comprehensive 3-4 sentence summary of the candidate's overall profile
+   - Include: Work experience, internships, projects, key achievements, education level, and relevant skills summary
+   - Read through the ENTIRE resume and create a holistic summary that captures who the candidate is professionally
+   - Example format: "[Name] is a [education level] student/graduate with experience in [key technologies/domains]. They have worked as [role] at [company] where they [key achievement]. They have also completed projects in [areas] and participated in [hackathons/competitions]. Their technical skills include [major skill categories]."
+   - DO include: Education level, work experience, major projects, key achievements, primary skill areas
+   - DO NOT include: Detailed certification names, exact dates, personal contact info, or verbose descriptions
+   - Make it a professional profile summary that gives a complete picture of the candidate
 
-2. **total_years_experience**: 
-   - Look for date ranges in experience sections (e.g., "2023 - 2024", "Jan 2024 - Present")
-   - Calculate total months/years from ALL experience periods
-   - Include internships, projects with durations, hackathons
-   - Convert months to years (6 months = 0.5 years)
-   - Sum all periods together
-   - If no explicit dates, estimate from context but be conservative
+2. **experience_entries** (CRITICAL - PATTERN-BASED EXTRACTION):
+   - IGNORE visual order, section headers, and column layout
+   - Treat resume text as an unordered flat document
+   - Extract experience entries using PATTERN MATCHING, not section headers
+   
+   An experience entry exists if ANY of these patterns are found:
+   - Role title + Company name together
+   - Company + Date range together  
+   - Internship/Intern/Developer/Researcher/Lead keywords + Date range
+   - Project name + Date range
+   - Company name + Role + Date range
+   
+   Examples of valid experience blocks:
+   - "ARIVARA AI | AI Research and Development Intern | May 2025 - Present"
+   - "VOFI.AI | Project Lead | April 2025"
+   - "Rajasthan Police Hackathon | Team Lead | January 2024"
+   - "Starlabs Technologies | Full Stack Developer | Feb 2024 - May 2024"
+   
+   For EACH extracted experience entry, return:
+   {{
+     "role": "Role title or project name",
+     "company": "Company/Organization name",
+     "date_range": "Raw date string (e.g., 'May 2025 - Present' or 'Jan 2024 - Apr 2024')",
+     "type": "one of: full-time, internship, part-time, freelance, academic"
+   }}
+   
+   Classification rules (STRICT):
+   - Contains "intern", "internship", "trainee" → "internship"
+   - Contains "hackathon", "project", "coursework", "competition" → "academic"
+   - Contains "freelance", "contract", "consulting" → "freelance" or "contract"
+   - Contains "part-time" → "part_time"
+   - Otherwise → "full-time"
+   
+   DO NOT:
+   - Calculate durations or months
+   - Convert dates to years
+   - Estimate missing dates
+   - Require proper formatting or line breaks
+   - Require section headers like "EXPERIENCE"
+   
+   Extract raw date strings ONLY. Examples: "May 2025 - Present", "February 2025 - April 2025", "January 2024"
 
 3. **education**: 
    - Find university/college names (often in ALL CAPS like "SRI KRISHNA COLLEGE OF ENGINEERING")
@@ -1516,18 +1565,21 @@ OUTPUT FORMAT (valid JSON only, no markdown):
   "email": "email if found",
   "phone": "phone if found",
   "skills": ["Python", "TensorFlow", "Java", ...],
-  "experience_summary": "2-3 sentences summarizing ALL practical experience from the resume",
-  "total_years_experience": 1.5,
+  "experience_summary": "3-4 sentence comprehensive profile summary including education, experience, projects, and key skills",
+  "experience_entries": [
+    {{"role": "Role title", "company": "Company name", "date_range": "May 2025 - Present", "type": "internship"}},
+    {{"role": "Project Lead", "company": "VOFI.AI", "date_range": "April 2025", "type": "academic"}}
+  ],
   "education": [{{"school": "College name", "degree": "Degree type", "dates": "Date"}}],
   "certifications": ["Cert names if found"],
   "interests": ["Only if explicit interests section exists, else []"]
 }}
 
 REMEMBER: 
-- experience_summary must come from ACTUAL experience/project sections in the resume text
-- Do NOT include education text in experience_summary
-- Do NOT include random text fragments
-- Read the resume carefully and extract what's actually there
+- experience_summary should be an OVERALL PROFILE SUMMARY, not just experience
+- Include education level, work experience, projects, and skill overview
+- Do NOT include random text fragments or personal contact details
+- Read the resume carefully and create a holistic professional summary
 
 Return ONLY valid JSON, no markdown formatting."""
                 
@@ -1614,7 +1666,16 @@ Return ONLY valid JSON, no markdown formatting."""
                         "phone": None,
                         "skills": [],
                         "experience_summary": resume_text[:500] if resume_text else "",
-                        "total_years_experience": 1.0,
+                        "experience_breakdown": {
+                            "full_time": "0 months",
+                            "internship": "0 months",
+                            "freelance": "0 months",
+                            "part_time": "0 months",
+                            "contract": "0 months",
+                            "academic": "0 months",
+                            "total": "0 months"
+                        },
+                        "total_years_experience": 0.0,  # For internal scoring only
                         "education": [],
                         "certifications": [],
                         "interests": []
@@ -1627,9 +1688,46 @@ Return ONLY valid JSON, no markdown formatting."""
                     if "experience_summary" not in candidate_profile or not isinstance(candidate_profile.get("experience_summary"), str):
                         logger.warning("experience_summary missing or invalid, using resume text excerpt")
                         candidate_profile["experience_summary"] = resume_text[:500] if resume_text else ""
-                    if "total_years_experience" not in candidate_profile or not isinstance(candidate_profile.get("total_years_experience"), (int, float)):
-                        logger.warning("total_years_experience missing or invalid, defaulting to 1.0")
-                        candidate_profile["total_years_experience"] = 1.0
+                    
+                    # Process experience entries and calculate breakdown
+                    experience_entries = candidate_profile.get("experience_entries", [])
+                    if not isinstance(experience_entries, list):
+                        experience_entries = []
+                    
+                    # Process and classify each entry
+                    processed_entries = []
+                    for entry in experience_entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        
+                        # Ensure type classification
+                        entry_text = f"{entry.get('role', '')} {entry.get('company', '')} {entry.get('date_range', '')}"
+                        entry_type = classify_experience_type(entry_text)
+                        
+                        # Parse date range
+                        date_range = entry.get("date_range", "")
+                        start_date, end_date = parse_date_range(date_range) if date_range else (None, None)
+                        
+                        processed_entry = {
+                            "role": entry.get("role", ""),
+                            "company": entry.get("company", ""),
+                            "date_range": date_range,
+                            "type": entry_type,
+                            "start_date": start_date,
+                            "end_date": end_date
+                        }
+                        processed_entries.append(processed_entry)
+                    
+                    # Calculate experience breakdown
+                    experience_breakdown = calculate_experience_breakdown(processed_entries)
+                    candidate_profile["experience_breakdown"] = experience_breakdown
+                    
+                    # Calculate total_years_experience from breakdown for internal scoring (but won't be in response)
+                    total_duration_str = experience_breakdown.get("total", "0 months")
+                    candidate_profile["total_years_experience"] = parse_duration_string(total_duration_str)
+                    
+                    logger.info(f"Calculated experience breakdown: {experience_breakdown}")
+                    logger.info(f"Total years (for internal scoring): {candidate_profile['total_years_experience']}")
                     if "education" not in candidate_profile or not isinstance(candidate_profile.get("education"), list):
                         candidate_profile["education"] = []
                     if "certifications" not in candidate_profile or not isinstance(candidate_profile.get("certifications"), list):
@@ -1654,19 +1752,29 @@ Return ONLY valid JSON, no markdown formatting."""
                 
                 # SEND resume_parsed event IMMEDIATELY (before file operations)
                 logger.info(f"Yielding resume_parsed event IMMEDIATELY with full candidate profile: name={candidate_profile.get('name')}")
+                # Remove total_years_experience and other float year fields from response
+                candidate_profile_response = {
+                    "name": candidate_profile.get("name"),
+                    "email": candidate_profile.get("email"),
+                    "phone": candidate_profile.get("phone"),
+                    "skills": candidate_profile.get("skills", []) if isinstance(candidate_profile.get("skills"), list) else [],
+                    "experience_summary": candidate_profile.get("experience_summary"),
+                    "experience_breakdown": candidate_profile.get("experience_breakdown", {
+                        "full_time": "0 months",
+                        "internship": "0 months",
+                        "freelance": "0 months",
+                        "part_time": "0 months",
+                        "contract": "0 months",
+                        "academic": "0 months",
+                        "total": "0 months"
+                    }),
+                    "education": candidate_profile.get("education", []),
+                    "certifications": candidate_profile.get("certifications", []),
+                    "interests": candidate_profile.get("interests", []),
+                    "raw_text_excerpt": candidate_profile.get("raw_text_excerpt")
+                }
                 yield format_sse_event("resume_parsed", {
-                    "candidate_profile": {
-                        "name": candidate_profile.get("name"),
-                        "email": candidate_profile.get("email"),
-                        "phone": candidate_profile.get("phone"),
-                        "skills": candidate_profile.get("skills", []) if isinstance(candidate_profile.get("skills"), list) else [],
-                        "experience_summary": candidate_profile.get("experience_summary"),
-                        "total_years_experience": candidate_profile.get("total_years_experience", 0),
-                        "education": candidate_profile.get("education", []),
-                        "certifications": candidate_profile.get("certifications", []),
-                        "interests": candidate_profile.get("interests", []),
-                        "raw_text_excerpt": candidate_profile.get("raw_text_excerpt")
-                    }
+                    "candidate_profile": candidate_profile_response
                 })
                 await asyncio.sleep(0)  # Force flush - CRITICAL for SSE
                 logger.info("✅ resume_parsed event sent and flushed - continuing to file writes")
@@ -1979,11 +2087,12 @@ Job Details:
 
 7. **MATCH CANDIDATE AGAINST EXTRACTED REQUIREMENTS:**
    - For each requirement extracted from job description, check if candidate has it
-   - Format: "Python (candidate lists Python as a skill)" or "Python (not mentioned in candidate profile)"
+   - Format for requirements_satisfied: "React (candidate lists React.js as a skill)"
+   - Format for requirements_missing: ".Net (not mentioned in candidate profile)" or "TypeScript (candidate lacks this skill)"
    - Be SPECIFIC about what candidate has vs. what's missing
    - Only match against requirements that were extracted from the description
    
-   **CRITICAL: SKILL VARIATION MATCHING:**
+   **CRITICAL: SKILL VARIATION MATCHING AND CORRECT PLACEMENT:**
    - Match skills with their variations - these are the SAME skill:
      * "React", "React.js", "ReactJS", "React JS" → all match
      * ".NET", ".Net", "ASP.NET", "dotnet", "DotNet" → all match
@@ -1993,10 +2102,13 @@ Job Details:
      * "SQL Server", "MySQL", "PostgreSQL", "SQL" → all match (database skills)
      * "C#", "CSharp", "C Sharp" → all match
      * "Python", "Python3", "python" → all match
-   - If job requires "React" and candidate has "React.js" → this is a MATCH (list in requirements_satisfied)
-   - If job requires ".Net" and candidate doesn't have it (in any variation) → list in requirements_missing
+   - If job requires "React" and candidate has "React.js" → this is a MATCH → PUT IN requirements_satisfied
+   - If job requires ".Net" and candidate does NOT have it (in any variation) → PUT IN requirements_missing (NOT requirements_satisfied)
+   - ⚠️ CRITICAL RULE: If a skill is NOT mentioned in candidate profile, it MUST go in requirements_missing, NEVER in requirements_satisfied
+   - ⚠️ NEVER put "(not mentioned in candidate profile)" items in requirements_satisfied - they belong in requirements_missing
    - Check candidate's skills array, experience_summary, and all sections for skill matches
    - When checking for a skill, look for ALL variations of that skill name
+   - Only put skills in requirements_satisfied if candidate ACTUALLY has that skill (or a variation of it)
 
 8. **REQUIREMENTS COUNTING:**
    - total_requirements = Count of ALL requirements explicitly mentioned in the description
@@ -2032,6 +2144,7 @@ FINAL REMINDERS:
 - ✅ If description is sparse, extract minimal requirements (don't fill gaps)
 - ✅ Be SPECIFIC - use exact names mentioned in description
 - ✅ requirements_satisfied and requirements_missing must list ONLY requirements from description
+- ✅ ⚠️ CRITICAL: If a skill is "(not mentioned in candidate profile)" or "(candidate lacks this skill)", it MUST go in requirements_missing, NEVER in requirements_satisfied
 - ✅ improvements_needed must reference specific items mentioned in description
 - ✅ Work across ALL domains but always extract from provided text only
 """
@@ -2551,8 +2664,34 @@ FINAL REMINDERS:
                 clean_job = {k: v for k, v in job.items() if k != "job_description"}
                 clean_matched_jobs.append(clean_job)
             
+            # Remove total_years_experience and all float year fields from final response
+            fields_to_remove = [
+                "total_years_experience",
+                "full_time_years",
+                "internship_years",
+                "freelance_years",
+                "part_time_years",
+                "contract_years",
+                "academic_years",
+                "project_years",
+                "total_weighted_years"
+            ]
+            candidate_profile_final = {k: v for k, v in candidate_profile.items() if k not in fields_to_remove}
+            
+            # Ensure experience_breakdown exists
+            if "experience_breakdown" not in candidate_profile_final:
+                candidate_profile_final["experience_breakdown"] = {
+                    "full_time": "0 months",
+                    "internship": "0 months",
+                    "freelance": "0 months",
+                    "part_time": "0 months",
+                    "contract": "0 months",
+                    "academic": "0 months",
+                    "total": "0 months"
+                }
+            
             final_response = {
-                "candidate_profile": candidate_profile,
+                "candidate_profile": candidate_profile_final,
                 "matched_jobs": clean_matched_jobs,  # job_description excluded from API response
                 "processing_time": processing_time,
                 "jobs_analyzed": len(jobs),
@@ -2562,7 +2701,7 @@ FINAL REMINDERS:
             
             logger.info("Yielding complete event")
             final_response_data = {
-                "candidate_profile": candidate_profile,
+                "candidate_profile": candidate_profile_final,
                 "matched_jobs": clean_matched_jobs,  # job_description excluded from API response
                 "processing_time": processing_time,
                 "jobs_analyzed": len(jobs),

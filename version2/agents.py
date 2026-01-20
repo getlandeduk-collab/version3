@@ -221,7 +221,7 @@ def build_resume_parser(model_name: str) -> Agent:
             "- name: Full name of candidate",
             "- email: Email address",
             "- phone: Phone number",
-            "- skills: Array of ALL technical skills, tools, frameworks, languages",
+            "- skills: Array of ALL  skills, tools, frameworks, languages",
             "- experience_summary: String summary of work experience",
             "- total_years_experience: Number (calculate total years from all roles)",
             "- education: Array of objects with school, degree, dates",
