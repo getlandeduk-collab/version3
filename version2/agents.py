@@ -318,14 +318,63 @@ def build_scraper(api_key: str = None) -> Agent:
 
 
 def normalize_skill(skill: str) -> str:
-    """Normalize skill name for comparison (lowercase, remove special chars)."""
+    """Normalize skill name for comparison with proper skill alias handling."""
     if not skill:
         return ""
-    # Convert to lowercase and remove special characters
-    normalized = re.sub(r'[^\w\s]', '', skill.lower().strip())
-    # Remove extra whitespace
+    
+    # Skill alias mappings - handle common variations
+    skill_lower = skill.lower().strip()
+    
+    # Handle React variations
+    if any(variant in skill_lower for variant in ['react.js', 'reactjs', 'react js']):
+        return 'react'
+    
+    # Handle .NET variations
+    if any(variant in skill_lower for variant in ['.net', 'dotnet', 'dot net', 'asp.net', 'aspnet']):
+        return 'dotnet'
+    
+    # Handle Node.js variations
+    if any(variant in skill_lower for variant in ['node.js', 'nodejs', 'node js']):
+        return 'nodejs'
+    
+    # Handle SQL variations
+    if any(variant in skill_lower for variant in ['sql server', 'mysql', 'postgresql', 'postgres', 'mssql']):
+        return 'sql'
+    
+    # Handle JavaScript/TypeScript variations
+    if 'typescript' in skill_lower or 'ts' == skill_lower:
+        return 'typescript'
+    if 'javascript' in skill_lower or 'js' == skill_lower or 'ecmascript' in skill_lower:
+        return 'javascript'
+    
+    # Handle Python variations
+    if 'python' in skill_lower:
+        return 'python'
+    
+    # Handle C# variations
+    if skill_lower in ['c#', 'csharp', 'c sharp']:
+        return 'csharp'
+    
+    # Handle C++ variations
+    if skill_lower in ['c++', 'cpp', 'c plus plus']:
+        return 'cpp'
+    
+    # Handle AWS variations
+    if 'aws' in skill_lower or 'amazon web services' in skill_lower:
+        return 'aws'
+    
+    # Handle Azure variations
+    if 'azure' in skill_lower or 'microsoft azure' in skill_lower:
+        return 'azure'
+    
+    # Handle GCP variations
+    if 'gcp' in skill_lower or 'google cloud' in skill_lower or 'google cloud platform' in skill_lower:
+        return 'gcp'
+    
+    # Default: lowercase, remove special chars, normalize whitespace
+    normalized = re.sub(r'[^\w\s]', '', skill_lower)
     normalized = re.sub(r'\s+', ' ', normalized)
-    return normalized
+    return normalized.strip()
 
 
 def extract_skills_from_text(text: str) -> List[str]:
@@ -337,8 +386,8 @@ def extract_skills_from_text(text: str) -> List[str]:
     skill_patterns = [
         # Programming languages
         r'\b(python|java|javascript|typescript|c\+\+|c#|ruby|php|swift|kotlin|go|rust|scala|r)\b',
-        # Web frameworks
-        r'\b(react|angular|vue|node\.?js|django|flask|spring|express|laravel|rails)\b',
+        # Web frameworks (include variations)
+        r'\b(react\.?js|reactjs|react\s+js|react|angular|vue|node\.?js|nodejs|django|flask|spring|express|laravel|rails|\.net|dotnet|asp\.net|aspnet)\b',
         # Databases
         r'\b(sql|mysql|postgresql|mongodb|redis|elasticsearch|oracle|cassandra|dynamodb)\b',
         # Cloud & DevOps

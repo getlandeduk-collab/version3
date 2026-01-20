@@ -1982,6 +1982,21 @@ Job Details:
    - Format: "Python (candidate lists Python as a skill)" or "Python (not mentioned in candidate profile)"
    - Be SPECIFIC about what candidate has vs. what's missing
    - Only match against requirements that were extracted from the description
+   
+   **CRITICAL: SKILL VARIATION MATCHING:**
+   - Match skills with their variations - these are the SAME skill:
+     * "React", "React.js", "ReactJS", "React JS" → all match
+     * ".NET", ".Net", "ASP.NET", "dotnet", "DotNet" → all match
+     * "TypeScript", "TS", "typescript" → all match
+     * "JavaScript", "JS", "javascript", "ECMAScript" → all match
+     * "Node.js", "NodeJS", "nodejs" → all match
+     * "SQL Server", "MySQL", "PostgreSQL", "SQL" → all match (database skills)
+     * "C#", "CSharp", "C Sharp" → all match
+     * "Python", "Python3", "python" → all match
+   - If job requires "React" and candidate has "React.js" → this is a MATCH (list in requirements_satisfied)
+   - If job requires ".Net" and candidate doesn't have it (in any variation) → list in requirements_missing
+   - Check candidate's skills array, experience_summary, and all sections for skill matches
+   - When checking for a skill, look for ALL variations of that skill name
 
 8. **REQUIREMENTS COUNTING:**
    - total_requirements = Count of ALL requirements explicitly mentioned in the description
