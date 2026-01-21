@@ -100,8 +100,6 @@ class MatchedJob(BaseModel):
     match_score: float = Field(ge=0.0, le=1.0)
     summary: Optional[str]
     key_matches: List[str] = Field(default_factory=list)
-    requirements_met: int = 0
-    total_requirements: int = 0
     requirements_satisfied: List[str] = Field(
         default_factory=list,
         description="List of specific requirements/skills that the candidate matches (e.g., 'Java', 'React', 'AWS')"

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 import logging
 from pathlib import Path
 from typing import Dict, Any, Optional, List
@@ -601,6 +602,120 @@ Respond with ONLY the number (1-{len(candidate_matches)}) of the correct match, 
         return candidate_matches[0]
 
 
+def verify_company_match_with_llm(
+    extracted_company_name: str,
+    csv_company_name: str,
+    job_content: Optional[str] = None,
+    openai_api_key: Optional[str] = None,
+    model_name: str = "gpt-4o-mini"
+) -> Dict[str, Any]:
+    """
+    Use fast LLM inference to verify if extracted company name matches CSV result.
+    
+    Args:
+        extracted_company_name: Company name extracted from job posting
+        csv_company_name: Company name from CSV database
+        job_content: Optional job posting content for context
+        openai_api_key: OpenAI API key (optional)
+        model_name: Model to use (default: gpt-4o-mini for fast inference)
+        
+    Returns:
+        Dict with 'verified' (bool), 'confidence' (str: 'high', 'medium', 'low'), and 'reasoning' (str)
+    """
+    try:
+        api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            logger.debug("OpenAI API key not available for verification, skipping LLM verification")
+            return {
+                'verified': True,  # Default to verified if LLM unavailable
+                'confidence': 'medium',
+                'reasoning': 'LLM verification skipped - API key not available'
+            }
+        
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        
+        # Build context from job content (first 200 chars for fast processing)
+        job_context = ""
+        if job_content:
+            job_context = f"\n\nJob posting excerpt (for context):\n{job_content[:200]}"
+        
+        prompt = f"""You are verifying if two company names refer to the same company.
+
+Extracted Company Name (from job posting): "{extracted_company_name}"
+CSV Company Name (from database): "{csv_company_name}"
+{job_context}
+
+Task: Determine if these two names refer to the same company.
+
+Consider:
+- Exact matches are the same
+- Common variations are the same (e.g., "Ltd" vs "Limited", "Inc" vs "Incorporated", "&" vs "and")
+- Abbreviations are the same (e.g., "Corp" = "Corporation")
+- Parent companies and subsidiaries might be different companies
+- Different companies with similar names are NOT the same
+
+Respond with ONLY a JSON object in this exact format:
+{{
+  "verified": true or false,
+  "confidence": "high" or "medium" or "low",
+  "reasoning": "Brief one-sentence explanation"
+}}
+
+Examples:
+- "Google" and "Google LLC" → verified: true, confidence: "high"
+- "Microsoft" and "Microsoft Corporation" → verified: true, confidence: "high"
+- "ABC Ltd" and "ABC Limited" → verified: true, confidence: "high"
+- "Amazon" and "Amazon Web Services" → verified: false (subsidiary), confidence: "medium"
+- "XYZ Corp" and "XYZ Inc" → verified: true (likely same), confidence: "medium"
+
+Return ONLY the JSON, no markdown, no explanations."""
+        
+        logger.debug(f"Verifying company match: '{extracted_company_name}' vs '{csv_company_name}'")
+        
+        # Use fast inference with streaming disabled for quick response
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,  # Deterministic
+            max_tokens=150,  # Short response for speed
+            response_format={"type": "json_object"}  # Enforce JSON for faster parsing
+        )
+        
+        response_text = response.choices[0].message.content.strip()
+        
+        # Parse JSON response
+        try:
+            result = json.loads(response_text)
+            verified = result.get('verified', True)
+            confidence = result.get('confidence', 'medium')
+            reasoning = result.get('reasoning', 'No reasoning provided')
+            
+            logger.debug(f"LLM verification result: verified={verified}, confidence={confidence}, reasoning={reasoning}")
+            
+            return {
+                'verified': verified,
+                'confidence': confidence,
+                'reasoning': reasoning
+            }
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse LLM verification JSON: {e}, response: {response_text[:100]}")
+            # Fallback: try to extract verified status from text
+            if 'verified' in response_text.lower() and 'true' in response_text.lower():
+                return {'verified': True, 'confidence': 'medium', 'reasoning': 'Parsed from response text'}
+            else:
+                return {'verified': True, 'confidence': 'low', 'reasoning': 'Failed to parse verification result'}
+                
+    except Exception as e:
+        logger.warning(f"Error in LLM verification: {e}", exc_info=True)
+        # Fallback to verified=True to not break the flow
+        return {
+            'verified': True,
+            'confidence': 'low',
+            'reasoning': f'Verification error: {str(e)}'
+        }
+
+
 def check_sponsorship(company_name: Optional[str], job_content: Optional[str] = None, openai_api_key: Optional[str] = None) -> Dict[str, Any]:
     """
     Check if a company sponsors workers by looking it up in the CSV.
@@ -633,11 +748,29 @@ def check_sponsorship(company_name: Optional[str], job_content: Optional[str] = 
         # Try exact match first (O(1) lookup - 40% faster)
         exact_match = get_exact_match(company_name)
         if exact_match:
+            csv_company_name = exact_match.get('Organisation Name')
+            
+            # Final LLM verification step to ensure extracted name matches CSV result
+            verification_result = verify_company_match_with_llm(
+                company_name,
+                csv_company_name,
+                job_content,
+                openai_api_key
+            )
+            
+            # If LLM says they don't match, log warning but still return the match
+            # (exact match is usually reliable, but LLM verification adds confidence)
+            if not verification_result.get('verified', True):
+                logger.warning(f"LLM verification suggests mismatch: '{company_name}' vs '{csv_company_name}' (confidence: {verification_result.get('confidence', 'low')})")
+            
+            summary = f"Exact match found: {csv_company_name} sponsors workers."
+            
             return {
-                'company_name': exact_match.get('Organisation Name'),
+                'company_name': csv_company_name,
                 'sponsors_workers': True,
                 'visa_types': exact_match.get('Type & Rating', ''),
-                'summary': f"Exact match found: {exact_match.get('Organisation Name')} sponsors workers."
+                'summary': summary,
+                'verification': verification_result
             }
         
         # Fallback to fuzzy matching if no exact match
@@ -653,26 +786,36 @@ def check_sponsorship(company_name: Optional[str], job_content: Optional[str] = 
             )
             
             if selected_match:
+                csv_company_name = selected_match['company_name']
+                
+                # Final LLM verification step to ensure extracted name matches CSV result
+                verification_result = verify_company_match_with_llm(
+                    company_name,
+                    csv_company_name,
+                    job_content,
+                    openai_api_key
+                )
+                
                 # Build summary
-                summary_parts = [f"{selected_match['company_name']} is a registered UK visa sponsor."]
+                summary_parts = [f"{csv_company_name} is a registered UK visa sponsor."]
                 if selected_match.get('visa_types') and selected_match['visa_types'] != "Not specified":
                     summary_parts.append(f"Visa Routes: {selected_match['visa_types']}.")
                 if selected_match.get('worker_types') and selected_match['worker_types'] != "Not specified":
                     summary_parts.append(f"Worker Types: {selected_match['worker_types']}.")
                 if selected_match.get('locations'):
                     summary_parts.append(f"Location(s): {selected_match['locations']}.")
-                summary_parts.append(f"Total active listings: {selected_match['total_listings']}.")
                 
                 summary = " ".join(summary_parts)
                 
-                logger.info(f"✓ Selected match: {selected_match['company_name']} (score: {selected_match['match_score']}%)")
+                logger.info(f"✓ Selected match: {csv_company_name} (score: {selected_match['match_score']}%, verified: {verification_result.get('verified', True)})")
                 
                 return {
-                    'company_name': selected_match['company_name'],
+                    'company_name': csv_company_name,
                     'sponsors_workers': True,
                     'visa_types': selected_match['visa_types'],
                     'summary': summary,
-                    'found_in_csv': True
+                    'found_in_csv': True,
+                    'verification': verification_result
                 }
             else:
                 # Agent determined none of the candidates match
@@ -681,7 +824,7 @@ def check_sponsorship(company_name: Optional[str], job_content: Optional[str] = 
                     'company_name': company_name,
                     'sponsors_workers': False,
                     'visa_types': None,
-                    'summary': f"{company_name} was not found in the UK visa sponsorship database. The AI agent reviewed {len(candidate_matches)} similar company names but determined none match. This may mean they do not currently sponsor workers, or the company name does not match exactly.",
+                    'summary': f"{company_name} was not found in the UK visa sponsorship database.",
                     'found_in_csv': False
                 }
         else:
@@ -691,7 +834,7 @@ def check_sponsorship(company_name: Optional[str], job_content: Optional[str] = 
                 'company_name': company_name,
                 'sponsors_workers': False,
                 'visa_types': None,
-                'summary': f"{company_name} was not found in the UK visa sponsorship database. This may mean they do not currently sponsor workers, or the company name does not match exactly.",
+                'summary': f"{company_name} was not found in the UK visa sponsorship database.",
                 'found_in_csv': False
             }
             

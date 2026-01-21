@@ -438,7 +438,7 @@ class FirebaseService:
             }
             
             if existing_doc_id:
-                # Duplicate found - update the existing document with latest data
+                # Duplicate found - replace the existing document with latest data
                 collection_ref = db.collection("users").document(user_id).collection("job_applications")
                 doc_ref = collection_ref.document(existing_doc_id)
                 
@@ -450,14 +450,15 @@ class FirebaseService:
                         document_data["createdAt"] = existing_data["createdAt"]
                     else:
                         document_data["createdAt"] = datetime.now()
-                    document_data["updatedAt"] = datetime.now()
                 else:
                     document_data["createdAt"] = datetime.now()
-                    document_data["updatedAt"] = datetime.now()
                 
-                # Update the existing document with latest data
-                doc_ref.update(document_data)
-                logger.info(f"✓ Updated duplicate job: {job_data.get('role', 'N/A')} at {job_data.get('company', 'N/A')}")
+                # Always set updatedAt to now when replacing
+                document_data["updatedAt"] = datetime.now()
+                
+                # Replace the entire document with latest data (using set with merge=False)
+                doc_ref.set(document_data)
+                logger.info(f"✓ Replaced duplicate job with latest data: {job_data.get('role', 'N/A')} at {job_data.get('company', 'N/A')} (ID: {existing_doc_id})")
                 return existing_doc_id
             
             # Add createdAt for new documents
@@ -687,17 +688,12 @@ class FirebaseService:
             
             # Extract company name for duplicate check
             company_name = job_info.get("company") if job_info else sponsorship_data.get("company_name", "")
-            
-            # Check for duplicates before saving
-            existing_doc_id = self._check_sponsorship_duplicate(user_id, company_name, request_id)
-            if existing_doc_id:
-                logger.debug(f"Duplicate sponsorship check found: {existing_doc_id}")
-                return existing_doc_id
             portal = job_info.get("portal", "") if job_info else ""
             job_url = job_info.get("job_url", "") if job_info else ""
             
             # Prepare document data with FLAT structure (same as job_applications)
             # This ensures consistency and avoids any potential nested object serialization issues
+            # Note: createdAt will be preserved from existing doc if duplicate found
             document_data = {
                 "requestId": request_id,
                 "companyName": company_name or "",
@@ -706,8 +702,35 @@ class FirebaseService:
                 "sponsorsWorkers": bool(sponsorship_data.get("sponsors_workers", False)),
                 "visaTypes": sponsorship_data.get("visa_types", "") or "",
                 "summary": sponsorship_data.get("summary", "") or "",
-                "createdAt": datetime.now(),  # EXACT same as job_applications
+                "createdAt": datetime.now(),  # Will be overwritten if duplicate found
             }
+            
+            # Check for duplicates before saving
+            existing_doc_id = self._check_sponsorship_duplicate(user_id, company_name, request_id)
+            if existing_doc_id:
+                logger.debug(f"Duplicate sponsorship check found: {existing_doc_id}, replacing with latest data")
+                # Replace the existing document with latest data
+                collection_ref = db.collection("sponsorship_checks").document(user_id).collection("checks")
+                doc_ref = collection_ref.document(existing_doc_id)
+                
+                # Get existing document to preserve createdAt if it exists
+                existing_doc = doc_ref.get()
+                if existing_doc.exists:
+                    existing_data = existing_doc.to_dict()
+                    if "createdAt" in existing_data:
+                        document_data["createdAt"] = existing_data["createdAt"]
+                    else:
+                        document_data["createdAt"] = datetime.now()
+                else:
+                    document_data["createdAt"] = datetime.now()
+                
+                # Always set updatedAt to now when replacing
+                document_data["updatedAt"] = datetime.now()
+                
+                # Replace the entire document with latest data
+                doc_ref.set(document_data)
+                logger.info(f"✓ Replaced duplicate sponsorship info with latest data: {company_name} (ID: {existing_doc_id})")
+                return existing_doc_id
             
             # Ensure user_id document exists
             user_doc_ref = db.collection("sponsorship_checks").document(user_id)

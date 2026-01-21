@@ -2106,9 +2106,17 @@ Job Details:
    - If job requires ".Net" and candidate does NOT have it (in any variation) → PUT IN requirements_missing (NOT requirements_satisfied)
    - ⚠️ CRITICAL RULE: If a skill is NOT mentioned in candidate profile, it MUST go in requirements_missing, NEVER in requirements_satisfied
    - ⚠️ NEVER put "(not mentioned in candidate profile)" items in requirements_satisfied - they belong in requirements_missing
+   - ⚠️ ABSOLUTE RULE: If your response text contains "(not mentioned in candidate profile)" or "(candidate lacks this skill)", that item MUST be in requirements_missing array, NEVER in requirements_satisfied
    - Check candidate's skills array, experience_summary, and all sections for skill matches
    - When checking for a skill, look for ALL variations of that skill name
    - Only put skills in requirements_satisfied if candidate ACTUALLY has that skill (or a variation of it)
+   - Example of CORRECT placement:
+     * Job requires: C#, PowerShell, Python
+     * Candidate has: Python, Java, React
+     * requirements_satisfied: ["Python (candidate lists Python as a skill)"]
+     * requirements_missing: ["C# (not mentioned in candidate profile)", "PowerShell (not mentioned in candidate profile)"]
+   - Example of WRONG placement (DO NOT DO THIS):
+     * requirements_satisfied: ["C# (not mentioned in candidate profile)"] ← WRONG! This should be in requirements_missing
 
 8. **REQUIREMENTS COUNTING:**
    - total_requirements = Count of ALL requirements explicitly mentioned in the description
@@ -2134,7 +2142,8 @@ Return ONLY valid JSON (no markdown) with the following structure:
     "Obtain [specific certification/tool/skill] - [specific reason from description]",
     "Gain experience with [specific tool/technology] for [specific purpose from description]"
   ],
-  "reasoning": "Brief explanation of score based on extracted requirements"
+  "reasoning": "Brief explanation of score based on extracted requirements",
+  "summary": "Write a concise analysis summary in this exact format: 'The candidate demonstrates [specific strengths/qualifications they have]. However, the role requires [key missing requirements], which are either missing or not evidenced in the candidate profile.' Example: 'The candidate demonstrates basic frontend development experience and has worked in small team environments. However, the role requires strong expertise in .NET, TypeScript, and UK residency history, which are either missing or not evidenced in the candidate profile.' Keep it to 2-3 sentences maximum."
 }}
 
 FINAL REMINDERS:
@@ -2313,8 +2322,30 @@ FINAL REMINDERS:
                 score = float(data_result.get("match_score", 0.5))
                 requirements_satisfied_list = data_result.get("requirements_satisfied", []) or []
                 requirements_missing_list = data_result.get("requirements_missing", []) or []
+                
+                # Post-processing: Fix misclassified requirements
+                # Move any items from requirements_satisfied that indicate the candidate doesn't have them
+                items_to_move = []
+                for item in requirements_satisfied_list:
+                    item_lower = str(item).lower()
+                    if "(not mentioned in candidate profile)" in item_lower or "(candidate lacks" in item_lower or "not mentioned" in item_lower:
+                        items_to_move.append(item)
+                        logger.warning(f"Found misclassified requirement in requirements_satisfied, moving to requirements_missing: {item}")
+                
+                # Move items from satisfied to missing
+                for item in items_to_move:
+                    requirements_satisfied_list.remove(item)
+                    if item not in requirements_missing_list:
+                        requirements_missing_list.append(item)
+                
                 requirements_met = int(data_result.get("requirements_met", 0))
                 total_requirements = int(data_result.get("total_requirements", 0))
+                
+                # Update requirements_met count if items were moved
+                if items_to_move:
+                    # Recalculate requirements_met based on actual satisfied list
+                    requirements_met = len(requirements_satisfied_list)
+                    logger.info(f"Adjusted requirements_met from {data_result.get('requirements_met', 0)} to {requirements_met} after fixing misclassifications")
                 
                 # Fallback: If no requirements extracted AND description is empty/sparse, use minimal fallback
                 # NOTE: This fallback should be VERY conservative - only use if description is truly empty
@@ -2381,6 +2412,26 @@ FINAL REMINDERS:
                 if requirements_met > total_requirements:
                     requirements_met = total_requirements
                 
+                # Extract reasoning separately (needed for logging)
+                reasoning = data_result.get("reasoning", "Score calculated based on candidate-job alignment")
+                
+                # Generate summary from LLM response
+                summary_text = data_result.get("summary", "")
+                if not summary_text:
+                    # Fallback: create summary from reasoning
+                    summary_parts = []
+                    if reasoning:
+                        summary_parts.append(reasoning[:200])
+                    key_matches = data_result.get("key_matches", []) or []
+                    if key_matches:
+                        matches_str = ', '.join(key_matches[:3])
+                        summary_parts.append(f"Key matches: {matches_str}.")
+                    summary_text = " ".join(summary_parts) if summary_parts else "Match analysis completed."
+                
+                # Trim summary if too long
+                if len(summary_text) > 500:
+                    summary_text = summary_text[:497] + "..."
+                
                 scored_jobs.append({
                     "job": job,
                     "match_score": score,
@@ -2391,23 +2442,16 @@ FINAL REMINDERS:
                     "requirements_missing": requirements_missing_list,
                     "improvements_needed": data_result.get("improvements_needed", []) or [],
                     "reasoning": data_result.get("reasoning", "Score calculated based on candidate-job alignment"),
+                    "summary": summary_text,
                 })
                 
                 # Event 6: Job scored - send complete job data as job_scored event
                 logger.info(f"Yielding job_scored event for job {idx}: score={score}")
                 
-                # Create summary from reasoning and key_matches
-                summary_parts = [f"Match score: {score:.1%}."]
-                reasoning = data_result.get("reasoning", "")
-                if reasoning:
-                    summary_parts.append(reasoning[:200])
-                key_matches = data_result.get("key_matches", []) or []
-                if key_matches:
-                    matches_str = ', '.join(key_matches[:3])
-                    summary_parts.append(f"Key matches: {matches_str}.")
-                summary_text = " ".join(summary_parts)
+                # Use the summary already generated above, ensure it's not too long
                 if len(summary_text) > 500:
                     summary_text = summary_text[:497] + "..."
+                key_matches = data_result.get("key_matches", []) or []
                 
                 # Write job scoring result to file
                 if response_file:
@@ -2442,8 +2486,6 @@ FINAL REMINDERS:
                     "match_score": round(score, 3),
                     "summary": summary_text,
                     "key_matches": key_matches,  # Send all key matches, not just first 5
-                    "requirements_met": requirements_met,
-                    "total_requirements": total_requirements,
                     "requirements_satisfied": requirements_satisfied_list,
                     "requirements_missing": requirements_missing_list,
                     "improvements_needed": data_result.get("improvements_needed", []) or [],
@@ -2471,15 +2513,17 @@ FINAL REMINDERS:
                 job = entry["job"]
                 score = entry["match_score"]
                 
-                # Create summary
-                summary_parts = [f"Match score: {score:.1%}."]
-                if entry.get("reasoning"):
-                    summary_parts.append(entry["reasoning"][:200])
-                if entry.get("key_matches"):
-                    matches_str = ', '.join(entry["key_matches"][:3])
-                    summary_parts.append(f"Key matches: {matches_str}.")
-                
-                summary_text = " ".join(summary_parts)
+                # Use LLM-generated summary if available, otherwise create fallback
+                summary_text = entry.get("summary", "")
+                if not summary_text:
+                    # Fallback: create summary from reasoning
+                    summary_parts = []
+                    if entry.get("reasoning"):
+                        summary_parts.append(entry["reasoning"][:200])
+                    if entry.get("key_matches"):
+                        matches_str = ', '.join(entry["key_matches"][:3])
+                        summary_parts.append(f"Key matches: {matches_str}.")
+                    summary_text = " ".join(summary_parts) if summary_parts else "Match analysis completed."
                 if len(summary_text) > 500:
                     summary_text = summary_text[:497] + "..."
                 
@@ -2491,8 +2535,6 @@ FINAL REMINDERS:
                     "match_score": round(score, 3),
                     "summary": summary_text,
                     "key_matches": entry["key_matches"],
-                    "requirements_met": entry["requirements_met"],
-                    "total_requirements": entry["total_requirements"],
                     "requirements_satisfied": entry["requirements_satisfied"],
                     "requirements_missing": entry["requirements_missing"],
                     "improvements_needed": entry["improvements_needed"],
