@@ -530,21 +530,23 @@ def select_correct_company_match(
                 "You are an expert at matching company names. Your task is to determine which candidate company",
                 "from the UK visa sponsorship database is the correct match for the job posting company.",
                 "",
-                "Consider the following factors (in order of importance):",
-                "1. Exact name matches are preferred",
-                "2. Location matching: Match the job location with the candidate company's locations from the CSV database",
+                "CRITICAL RULES - BE STRICT:",
+                "1. The company names MUST be clearly the same company, not just similar",
+                "2. Exact name matches are preferred (e.g., 'FamPay' matches 'FamPay Ltd')",
+                "3. Different companies with different names are NOT matches (e.g., 'FamPay' ≠ 'MPA', 'Amazon' ≠ 'Amazon Web Services' if different entities)",
+                "4. Common abbreviations and legal suffixes are OK (e.g., 'Ltd' vs 'Limited', 'Inc' vs 'Incorporated')",
+                "5. Location matching: Match the job location with the candidate company's locations from the CSV database",
                 "   - Location matches are STRONG indicators of correctness",
                 "   - Consider city names, counties, and regions",
                 "   - Even partial location matches can help identify the correct company",
-                "3. Common abbreviations (e.g., 'Ltd' vs 'Limited', 'Inc' vs 'Incorporated')",
-                "4. Company name variations and legal entity suffixes",
-                "5. Industry and business context from the job posting",
+                "6. Industry and business context from the job posting should align",
                 "",
-                "CRITICAL: Use location information from both the job posting AND the CSV database to help identify",
-                "the correct match. Companies often have specific locations where they operate.",
+                "VERIFICATION CHECK: Before selecting a match, ask yourself:",
+                "'Would a reasonable person consider this candidate to be the EXACT SAME company as the job posting company?'",
+                "If the answer is NO or UNCERTAIN, select '0' (no match).",
                 "",
                 "You must respond with ONLY the number (1, 2, 3, etc.) corresponding to the correct match.",
-                "If none of the candidates seem correct, respond with '0'.",
+                "If none of the candidates clearly match, respond with '0'.",
                 "Do not include any explanation, just the number.",
             ],
             show_tool_calls=False,
@@ -640,34 +642,40 @@ def verify_company_match_with_llm(
         if job_content:
             job_context = f"\n\nJob posting excerpt (for context):\n{job_content[:200]}"
         
-        prompt = f"""You are verifying if two company names refer to the same company.
+        prompt = f"""You are verifying if two company names refer to the SAME company. BE STRICT - only verify if they are clearly the same company.
 
 Extracted Company Name (from job posting): "{extracted_company_name}"
 CSV Company Name (from database): "{csv_company_name}"
 {job_context}
 
-Task: Determine if these two names refer to the same company.
+CRITICAL VERIFICATION RULES:
+1. The company names MUST be essentially the same company, not just similar
+2. EXACT matches = verified (e.g., "FamPay" = "FamPay")
+3. Common legal suffix variations = verified (e.g., "FamPay Ltd" = "FamPay Limited", "FamPay Inc" = "FamPay Incorporated")
+4. Minor spelling variations = verified ONLY if clearly the same company (e.g., "FamPay" = "FamPay Limited")
+5. Different companies with similar names = NOT verified (e.g., "FamPay" ≠ "MPA", "FamPay" ≠ "FamPay Technologies" if they're different entities)
+6. Abbreviations that match the core name = verified (e.g., "FamPay" = "FP Limited" only if FP clearly stands for FamPay)
+7. Parent companies and subsidiaries = NOT verified unless clearly the same legal entity
+8. Companies with completely different names = NOT verified (e.g., "FamPay" ≠ "MPA", "Amazon" ≠ "Amazon Web Services" if different entities)
 
-Consider:
-- Exact matches are the same
-- Common variations are the same (e.g., "Ltd" vs "Limited", "Inc" vs "Incorporated", "&" vs "and")
-- Abbreviations are the same (e.g., "Corp" = "Corporation")
-- Parent companies and subsidiaries might be different companies
-- Different companies with similar names are NOT the same
+STRICT CHECK: Ask yourself "Would a reasonable person consider these the EXACT SAME company?" If unsure, answer false.
 
 Respond with ONLY a JSON object in this exact format:
 {{
   "verified": true or false,
   "confidence": "high" or "medium" or "low",
-  "reasoning": "Brief one-sentence explanation"
+  "reasoning": "Brief one-sentence explanation of why they match or don't match"
 }}
 
 Examples:
+- "FamPay" and "FamPay" → verified: true, confidence: "high"
+- "FamPay" and "FamPay Ltd" → verified: true, confidence: "high"
+- "FamPay" and "MPA" → verified: false, confidence: "high" (completely different names)
 - "Google" and "Google LLC" → verified: true, confidence: "high"
 - "Microsoft" and "Microsoft Corporation" → verified: true, confidence: "high"
 - "ABC Ltd" and "ABC Limited" → verified: true, confidence: "high"
-- "Amazon" and "Amazon Web Services" → verified: false (subsidiary), confidence: "medium"
-- "XYZ Corp" and "XYZ Inc" → verified: true (likely same), confidence: "medium"
+- "Amazon" and "Amazon Web Services" → verified: false (different legal entities), confidence: "medium"
+- "XYZ Corp" and "XYZ Inc" → verified: false (unless proven same company), confidence: "low"
 
 Return ONLY the JSON, no markdown, no explanations."""
         
@@ -758,22 +766,24 @@ def check_sponsorship(company_name: Optional[str], job_content: Optional[str] = 
                 openai_api_key
             )
             
-            # If LLM says they don't match, log warning but still return the match
-            # (exact match is usually reliable, but LLM verification adds confidence)
+            # STRICT: If LLM says they don't match, reject the exact match and try fuzzy matching instead
             if not verification_result.get('verified', True):
-                logger.warning(f"LLM verification suggests mismatch: '{company_name}' vs '{csv_company_name}' (confidence: {verification_result.get('confidence', 'low')})")
-            
-            summary = f"Exact match found: {csv_company_name} sponsors workers."
-            
-            return {
-                'company_name': csv_company_name,
-                'sponsors_workers': True,
-                'visa_types': exact_match.get('Type & Rating', ''),
-                'summary': summary,
-                'verification': verification_result
-            }
+                logger.warning(f"LLM verification REJECTED exact match: '{company_name}' vs '{csv_company_name}' (confidence: {verification_result.get('confidence', 'low')}, reason: {verification_result.get('reasoning', 'N/A')})")
+                # Fall through to fuzzy matching to find correct company
+                exact_match = None
+            else:
+                # Exact match verified - return it
+                summary = f"{csv_company_name} is a registered UK visa sponsor. Visa Routes: {exact_match.get('Type & Rating', '')}."
+                
+                return {
+                    'company_name': csv_company_name,
+                    'sponsors_workers': True,
+                    'visa_types': exact_match.get('Type & Rating', ''),
+                    'summary': summary,
+                    'verification': verification_result
+                }
         
-        # Fallback to fuzzy matching if no exact match
+        # Fallback to fuzzy matching if no exact match (or exact match was rejected)
         candidate_matches = find_multiple_company_matches_in_csv(company_name, df, threshold=70, top_n=5)
         
         if candidate_matches:
@@ -788,7 +798,7 @@ def check_sponsorship(company_name: Optional[str], job_content: Optional[str] = 
             if selected_match:
                 csv_company_name = selected_match['company_name']
                 
-                # Final LLM verification step to ensure extracted name matches CSV result
+                # Final STRICT LLM verification step - reject if not a match
                 verification_result = verify_company_match_with_llm(
                     company_name,
                     csv_company_name,
@@ -796,6 +806,20 @@ def check_sponsorship(company_name: Optional[str], job_content: Optional[str] = 
                     openai_api_key
                 )
                 
+                # STRICT: Reject the match if LLM verification fails
+                if not verification_result.get('verified', True):
+                    logger.warning(f"LLM verification REJECTED fuzzy match: '{company_name}' vs '{csv_company_name}' (confidence: {verification_result.get('confidence', 'low')}, reason: {verification_result.get('reasoning', 'N/A')})")
+                    # Treat as no match found
+                    return {
+                        'company_name': company_name,
+                        'sponsors_workers': False,
+                        'visa_types': None,
+                        'summary': f"{company_name} was not found in the UK visa sponsorship database. The AI agent reviewed similar company names but determined none match.",
+                        'found_in_csv': False,
+                        'verification': verification_result
+                    }
+                
+                # Match verified - return it
                 # Build summary
                 summary_parts = [f"{csv_company_name} is a registered UK visa sponsor."]
                 if selected_match.get('visa_types') and selected_match['visa_types'] != "Not specified":

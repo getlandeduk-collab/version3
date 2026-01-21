@@ -202,6 +202,7 @@ def extract_jobs_from_response(api_response: dict) -> List[dict]:
                 "role": job_title,  # EXACT same as test_firebase_simple.py line 96
                 "status": "Matched",  # Use "Matched" for auto-matched jobs (not "Applied")
                 "visaRequired": "No",  # EXACT same as test_firebase_simple.py line 98
+                "match_score": float(match_score),  # Match score (0.0-1.0)
                 "requirements_met": requirements_satisfied,  # List of requirements that are met
                 "requirements_not_met": requirements_missing,  # List of requirements that are not met
                 "improvements_needed": improvements_needed,  # List of suggested improvements

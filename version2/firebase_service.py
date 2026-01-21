@@ -431,6 +431,7 @@ class FirebaseService:
                 "role": job_data.get("role", ""),
                 "status": job_data.get("status", "Applied"),
                 "visaRequired": job_data.get("visaRequired", "No"),
+                "match_score": float(job_data.get("match_score", 0.0)),  # Match score (0.0-1.0)
                 "requirements_met": job_data.get("requirements_met", []),  # List of requirements that are met
                 "requirements_not_met": job_data.get("requirements_not_met", []),  # List of requirements that are not met
                 "improvements_needed": job_data.get("improvements_needed", []),  # List of suggested improvements
