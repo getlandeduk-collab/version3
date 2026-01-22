@@ -2030,7 +2030,7 @@ Return ONLY valid JSON, no markdown formatting."""
                 description_length = len(job_description_text)
                 
                 prompt = f"""
-Analyze the match between candidate and job. Extract requirements, skills, qualifications, and competencies ONLY from the job description text provided below. This analysis must work for ALL domains (Technology, Healthcare, Finance, Marketing, Sales, Engineering, Design, Education, Legal, etc.).
+You are a strict requirement-based job-candidate evaluator. Your task is to factually assess whether a candidate meets the EXACT requirements stated in the job description. NO assumptions, NO skill inflation, NO invented matches.
 
 Candidate Profile:
 {json.dumps(candidate_profile, indent=2)}
@@ -2042,120 +2042,137 @@ Job Details:
 - Description: {job_description_text}
 - Description Length: {description_length} characters
 
-🚨 CRITICAL ANTI-HALLUCINATION RULES (MUST FOLLOW STRICTLY):
+🚨 MANDATORY EVALUATION RULES (DO NOT VIOLATE):
 
-1. **ONLY EXTRACT FROM PROVIDED JOB DESCRIPTION TEXT:**
-   - Extract requirements ONLY from the "Description" field above
-   - Each requirement MUST be explicitly mentioned or clearly stated in the description text
-   - DO NOT use general knowledge about similar job titles
-   - DO NOT infer requirements based on company name or industry
-   - DO NOT add common requirements that "typically" exist for this role type
-   - If a requirement is NOT in the description text, it MUST NOT appear in your output
+1. **EXTRACT ALL REQUIREMENTS - STRICT EXTRACTION (NO INVENTION):**
+   - Extract ONLY requirements explicitly stated in the job description
+   - Read the ENTIRE description and list EVERY requirement as a separate bullet point
+   - Extract from ALL sections: "Requirements", "Qualifications", "Skills", "Must Have", "Nice to Have", "Responsibilities", "Education", "Experience", etc.
+   - Categorize requirements into:
+     * Education Requirements (degree level, field of study) - ONLY if explicitly mentioned
+     * Experience Requirements (years, type of experience) - ONLY if explicitly mentioned
+     * Role Responsibilities (specific duties mentioned) - ONLY if explicitly mentioned
+     * Technical Skills REQUIRED (specific technologies, tools, languages marked as required/must have) - ONLY if explicitly mentioned
+     * Technical Skills PREFERRED (specific technologies, tools, languages marked as preferred/nice to have) - ONLY if explicitly mentioned
+     * Soft Skills (communication, leadership, etc.) - ONLY if explicitly mentioned
+     * Domain Knowledge (industry-specific experience) - ONLY if explicitly mentioned
+   - ⚠️ CRITICAL: Mark skills as REQUIRED or PREFERRED based on job description wording
+   - ⚠️ DO NOT extract: Certifications (unless explicitly mentioned), Location requirements, visa/work authorization, security clearance UNLESS explicitly mentioned in description
+   - ⚠️ DO NOT infer requirements - only extract what is explicitly stated
+   - ⚠️ DO NOT add "typical" requirements for this role type
+   - ⚠️ DO NOT invent requirements based on job title or company name
+   - ⚠️ If a requirement category is NOT mentioned in job description, DO NOT include it in your output
 
-2. **VALIDATION RULE - TRACEABILITY:**
-   - For EVERY requirement you list, you must be able to point to specific text in the description
-   - Example: If you list "Python" as a requirement, the description must contain the word "Python" or clearly mention Python
-   - If you list "3+ years experience", the description must explicitly state "3+ years" or similar
-   - If you list "Bachelor's degree", the description must mention "Bachelor's" or "degree" requirement
-   - If you cannot trace a requirement to specific text in the description, DO NOT include it
+2. **STRICT REQUIREMENT EVALUATION - NO ASSUMPTIONS:**
+   - For EACH requirement, check candidate profile for EXPLICIT evidence
+   - DO NOT assume or infer experience
+   - DO NOT count unrelated skills as matches
+   - DO NOT inflate matches - be factual and strict
 
-3. **JOB TITLE USAGE (LIMITED):**
-   - Job title can ONLY be used to understand the role type (e.g., "Software Engineer", "Nurse", "Accountant")
-   - DO NOT extract requirements from job title alone
-   - Example: "Senior Software Engineer" title → You can understand it's a software role, but DO NOT assume "5+ years" unless description says so
-   - Example: "Marketing Manager" title → You can understand it's marketing, but DO NOT assume "HubSpot" unless description mentions it
+3. **EXPERIENCE REQUIREMENTS - CRITICAL RULES:**
+   - If job requires "X years of experience", ONLY count full-time work experience
+   - Internships DO NOT count toward years of experience requirements
+   - Academic projects DO NOT count toward years of experience requirements
+   - Part-time work counts proportionally (e.g., 2 years part-time = 1 year full-time)
+   - If candidate is a student with only internships/academic projects and job requires experience → NOT MET
+   - Example: Job requires "3+ years experience", candidate has 2 internships (6 months each) → NOT MET (internships don't count)
+   - Example: Job requires "5 years experience", candidate has 1 year full-time + 2 years part-time → Calculate: 1 + (2/2) = 2 years → NOT MET
 
-4. **SPARSE DESCRIPTIONS HANDLING:**
-   - If description is very short or sparse, extract ONLY what is explicitly stated
-   - If description says "Python required" → Extract "Python"
-   - If description says "3+ years experience" → Extract "3+ years experience"
-   - If description only has job title and no details → Extract minimal requirements (maybe just role type from title)
-   - DO NOT fill in gaps with assumptions or typical requirements
+4. **EDUCATION REQUIREMENTS (CRITICAL - NO BINARY LOGIC):**
+   - Match exact degree level required (Bachelor's, Master's, PhD)
+   - ⚠️ CRITICAL RULE: If job requires "Bachelor's degree" and candidate is "pursuing Bachelor's" or "expected graduation 2027" → PARTIALLY MET (NOT NOT MET)
+   - ⚠️ CRITICAL RULE: If job requires "completed Bachelor's degree" and candidate is "pursuing Bachelor's" → PARTIALLY MET
+   - If job requires "Master's degree" and candidate has only "Bachelor's" → NOT MET
+   - If job requires "Master's degree" and candidate is "pursuing Master's" → PARTIALLY MET
+   - Field of study must match if specified (e.g., "Computer Science" ≠ "Electrical Engineering" unless job accepts both)
+   - ⚠️ DO NOT downgrade PARTIALLY_MET to NOT_MET for education - degree in progress IS partial match
 
-5. **BE SPECIFIC - EXTRACT EXACT NAMES:**
-   - If description mentions "Python libraries", extract SPECIFIC names mentioned: "numpy", "pandas" (only if these specific names appear)
-   - If description mentions "frameworks", extract SPECIFIC names: "React", "Django" (only if these specific names appear)
-   - If description mentions "certifications", extract SPECIFIC names: "RN license", "CPA" (only if these specific names appear)
-   - DO NOT generalize: If description says "Python", extract "Python" not "Python and related libraries"
-   - DO NOT expand: If description says "databases", extract "databases" but DO NOT list "PostgreSQL, MySQL, MongoDB" unless those are mentioned
+5. **TECHNICAL SKILLS - REQUIRED vs PREFERRED (CRITICAL DISTINCTION):**
+   - ⚠️ CRITICAL: Differentiate between REQUIRED and PREFERRED skills
+   - REQUIRED skills: Must be explicitly in candidate profile → MET or NOT MET
+   - PREFERRED skills: If candidate has it → PARTIALLY MET, if not → NOT MET
+   - Only count skills EXPLICITLY listed in candidate profile
+   - DO NOT count AI/ML/Python skills unless job explicitly requires them
+   - DO NOT assume related skills (e.g., "Python" does NOT automatically mean "Data Science")
+   - Skill variations are acceptable (React.js = React, .NET = .Net, SQL = MySQL = PostgreSQL, etc.)
+   - If job requires "TypeScript" and candidate has "JavaScript" but NOT "TypeScript" → NOT MET (they are different)
+   - If job requires "Python" and candidate has "Python" → MET
+   - If job PREFERS "SQL" and candidate has "SQL" or "MySQL" or "PostgreSQL" → PARTIALLY MET (preferred skill matched)
+   - If job PREFERS "SQL" and candidate does NOT have it → NOT MET
+   - ⚠️ DO NOT treat preferred skills as required - they should be PARTIALLY_MET when matched
 
-6. **EXTRACT ALL CANDIDATE SKILLS FROM PROFILE:**
-   - Review candidate's skills array COMPLETELY - include ALL skills mentioned
-   - Review candidate's experience_summary for additional skills, tools, technologies
-   - Review candidate's education, certifications, projects for relevant qualifications
-   - This is the ONLY place where you should be comprehensive (candidate profile, not job description)
+6. **ROLE RESPONSIBILITIES:**
+   - Check if candidate's experience_summary or experience_entries show evidence of similar responsibilities
+   - Be strict - vague matches are NOT MET
+   - Example: Job requires "Team leadership" and candidate has "worked in a team" → NOT MET (leadership ≠ team member)
 
-7. **MATCH CANDIDATE AGAINST EXTRACTED REQUIREMENTS:**
-   - For each requirement extracted from job description, check if candidate has it
-   - Format for requirements_satisfied: "React (candidate lists React.js as a skill)"
-   - Format for requirements_missing: ".Net (not mentioned in candidate profile)" or "TypeScript (candidate lacks this skill)"
-   - Be SPECIFIC about what candidate has vs. what's missing
-   - Only match against requirements that were extracted from the description
-   
-   **CRITICAL: SKILL VARIATION MATCHING AND CORRECT PLACEMENT:**
-   - Match skills with their variations - these are the SAME skill:
-     * "React", "React.js", "ReactJS", "React JS" → all match
-     * ".NET", ".Net", "ASP.NET", "dotnet", "DotNet" → all match
-     * "TypeScript", "TS", "typescript" → all match
-     * "JavaScript", "JS", "javascript", "ECMAScript" → all match
-     * "Node.js", "NodeJS", "nodejs" → all match
-     * "SQL Server", "MySQL", "PostgreSQL", "SQL" → all match (database skills)
-     * "C#", "CSharp", "C Sharp" → all match
-     * "Python", "Python3", "python" → all match
-   - If job requires "React" and candidate has "React.js" → this is a MATCH → PUT IN requirements_satisfied
-   - If job requires ".Net" and candidate does NOT have it (in any variation) → PUT IN requirements_missing (NOT requirements_satisfied)
-   - ⚠️ CRITICAL RULE: If a skill is NOT mentioned in candidate profile, it MUST go in requirements_missing, NEVER in requirements_satisfied
-   - ⚠️ NEVER put "(not mentioned in candidate profile)" items in requirements_satisfied - they belong in requirements_missing
-   - ⚠️ ABSOLUTE RULE: If your response text contains "(not mentioned in candidate profile)" or "(candidate lacks this skill)", that item MUST be in requirements_missing array, NEVER in requirements_satisfied
-   - Check candidate's skills array, experience_summary, and all sections for skill matches
-   - When checking for a skill, look for ALL variations of that skill name
-   - Only put skills in requirements_satisfied if candidate ACTUALLY has that skill (or a variation of it)
-   - Example of CORRECT placement:
-     * Job requires: C#, PowerShell, Python
-     * Candidate has: Python, Java, React
-     * requirements_satisfied: ["Python (candidate lists Python as a skill)"]
-     * requirements_missing: ["C# (not mentioned in candidate profile)", "PowerShell (not mentioned in candidate profile)"]
-   - Example of WRONG placement (DO NOT DO THIS):
-     * requirements_satisfied: ["C# (not mentioned in candidate profile)"] ← WRONG! This should be in requirements_missing
+7. **SOFT SKILLS:**
+   - Only count if explicitly mentioned in candidate profile OR clearly evidenced in experience
+   - DO NOT infer soft skills from technical work
 
-8. **REQUIREMENTS COUNTING:**
-   - total_requirements = Count of ALL requirements explicitly mentioned in the description
-   - requirements_met = Count of requirements that candidate satisfies
-   - If description has no explicit requirements, total_requirements should be low (maybe 1-2 based on role type from title only)
-   - DO NOT inflate requirement counts with assumptions
+8. **MATCH STATUS LABELS:**
+   - MET: Candidate has explicit evidence meeting the requirement
+   - PARTIALLY MET: Candidate has some evidence but not fully (e.g., pursuing degree vs. completed degree)
+   - NOT MET: No evidence or insufficient evidence in candidate profile
+
+9. **MATCH PERCENTAGE CALCULATION (STRICT):**
+   - Match Percentage = (Requirements MET / Total Requirements) × 100
+   - ⚠️ CRITICAL: PARTIALLY MET does NOT count toward match percentage
+   - Only fully MET requirements contribute to the score
+   - Example: 8 total requirements, 3 MET, 2 PARTIALLY MET, 3 NOT MET
+   - Calculation: 3 / 8 = 37.5% match (NOT 50% - partial matches don't count)
+   - Round to 2 decimal places
+
+10. **FINAL VERDICT (STRICT):**
+    - STRONG FIT: Match percentage ≥ 75% AND all critical requirements (experience, education) are MET
+    - PARTIAL FIT: Match percentage 40-74% (even if some requirements are PARTIALLY MET)
+    - NOT A FIT: Match percentage < 40% OR critical requirements are NOT MET
 
 Return ONLY valid JSON (no markdown) with the following structure:
 {{
-  "match_score": 0.75,
-  "key_matches": ["Specific skill 1", "Specific skill 2", "Specific qualification"],
-  "requirements_met": 5,
+  "match_score": 0.00,
+  "key_matches": ["Only skills/qualifications that are explicitly MET (not PARTIALLY MET)"],
+  "requirements_met": 0,
   "total_requirements": 8,
   "requirements_satisfied": [
-    "Specific requirement 1 (candidate has [specific evidence])",
-    "Specific requirement 2 (candidate [specific match])"
+    "Requirement 1 (MET - candidate has [explicit evidence])",
+    "Requirement 2 (MET - candidate lists [specific skill] as a skill)"
   ],
   "requirements_missing": [
-    "Specific requirement 3 (not mentioned in candidate profile)",
-    "Specific requirement 4 (candidate lacks [specific item])"
+    "Requirement 3 (NOT MET - not mentioned in candidate profile)",
+    "Requirement 4 (NOT MET - candidate lacks [specific item])",
+    "Requirement 5 (NOT MET - internships do not count for experience requirement)"
   ],
-  "improvements_needed": [
-    "Obtain [specific certification/tool/skill] - [specific reason from description]",
-    "Gain experience with [specific tool/technology] for [specific purpose from description]"
+  "requirements_partially_met": [
+    "Education (PARTIALLY MET - candidate is pursuing Bachelor's degree, job requires completed degree)",
+    "SQL (PARTIALLY MET - candidate has SQL, job lists SQL as preferred skill)"
   ],
-  "reasoning": "Brief explanation of score based on extracted requirements",
-  "summary": "Write a concise analysis summary in this exact format: 'The candidate demonstrates [specific strengths/qualifications they have]. However, the role requires [key missing requirements], which are either missing or not evidenced in the candidate profile.' Example: 'The candidate demonstrates basic frontend development experience and has worked in small team environments. However, the role requires strong expertise in .NET, TypeScript, and UK residency history, which are either missing or not evidenced in the candidate profile.' Keep it to 2-3 sentences maximum."
+  "improvements_needed": [],
+  "reasoning": "Strict factual assessment: [X] requirements met out of [Y] total. [Z] requirements partially met (do not count toward score). [Critical missing requirements]. Match percentage: [X/Y × 100]%",
+  "summary": "One-sentence factual verdict: 'The candidate meets [X] out of [Y] requirements and partially meets [Z] requirements. [Critical gap if any].' Example: 'The candidate meets 0 out of 8 requirements and partially meets 2 requirements (education in progress, SQL preferred skill). Critical gaps: lacks required 3+ years experience (only has internships), missing required Rightsline platform skill.'"
 }}
 
-FINAL REMINDERS:
-- ✅ Extract requirements ONLY from the description text provided
-- ✅ Each requirement must be traceable to specific text in the description
-- ✅ DO NOT use general knowledge or assumptions about similar jobs
-- ✅ If description is sparse, extract minimal requirements (don't fill gaps)
-- ✅ Be SPECIFIC - use exact names mentioned in description
-- ✅ requirements_satisfied and requirements_missing must list ONLY requirements from description
-- ✅ ⚠️ CRITICAL: If a skill is "(not mentioned in candidate profile)" or "(candidate lacks this skill)", it MUST go in requirements_missing, NEVER in requirements_satisfied
-- ✅ improvements_needed must reference specific items mentioned in description
-- ✅ Work across ALL domains but always extract from provided text only
+FINAL REMINDERS - STRICT EVALUATION CHECKLIST:
+- ✅ Extract ALL requirements from job description - be comprehensive
+- ✅ For EACH requirement, check candidate profile for EXPLICIT evidence
+- ✅ Internships and academic projects DO NOT count for experience years
+- ✅ Students with only internships = NOT MET for experience requirements
+- ✅ DO NOT count AI/ML/Python unless job explicitly requires them
+- ✅ DO NOT inflate matches - be strict and factual
+- ✅ Match percentage = MET / Total × 100 (PARTIALLY_MET does NOT count)
+- ✅ Every requirement must be labeled: MET, PARTIALLY MET, or NOT MET
+- ✅ Provide explicit evidence for each label
+- ✅ ⚠️ CRITICAL: Degree in progress (pursuing Bachelor's/Master's) = PARTIALLY MET, NOT NOT MET
+- ✅ ⚠️ CRITICAL: Preferred skills matched by candidate = PARTIALLY MET, NOT NOT MET
+- ✅ ⚠️ CRITICAL: DO NOT invent requirements - if certification/location/visa not in description, DO NOT include it
+- ✅ total_requirements MUST equal len(requirements_satisfied) + len(requirements_missing) + len(requirements_partially_met)
+- ✅ requirements_met = len(requirements_satisfied) ONLY (PARTIALLY_MET does NOT count toward requirements_met)
+- ✅ Match percentage = requirements_met / total_requirements × 100 (PARTIALLY_MET does NOT contribute to score)
+- ✅ Final verdict: STRONG FIT (≥75%), PARTIAL FIT (40-74%), NOT A FIT (<40%)
+- ✅ Summary must be factual, not softened - state gaps clearly
+- ✅ DO NOT add suggestions, strengths, or unrelated skills
+- ✅ DO NOT rephrase requirements - use exact wording from description
+- ✅ DO NOT include requirements that say "no specific X required" or "not mentioned" - these are invented
 """
                 
                 # Stream the scoring response using a simpler, more direct approach
@@ -2314,6 +2331,8 @@ FINAL REMINDERS:
                     data_result["requirements_satisfied"] = []
                 if "requirements_missing" not in data_result or not isinstance(data_result.get("requirements_missing"), list):
                     data_result["requirements_missing"] = []
+                if "requirements_partially_met" not in data_result or not isinstance(data_result.get("requirements_partially_met"), list):
+                    data_result["requirements_partially_met"] = []
                 if "improvements_needed" not in data_result or not isinstance(data_result.get("improvements_needed"), list):
                     data_result["improvements_needed"] = []
                 if "reasoning" not in data_result or not isinstance(data_result.get("reasoning"), str):
@@ -2322,6 +2341,115 @@ FINAL REMINDERS:
                 score = float(data_result.get("match_score", 0.5))
                 requirements_satisfied_list = data_result.get("requirements_satisfied", []) or []
                 requirements_missing_list = data_result.get("requirements_missing", []) or []
+                requirements_partially_met_list = data_result.get("requirements_partially_met", []) or []
+                
+                # Post-processing: Filter out invented requirements (certifications, location, visa, clearance unless explicitly mentioned)
+                # This prevents LLM from adding requirements not in the job description
+                def is_invented_requirement(req_text):
+                    """Check if requirement was invented (not explicitly in job description)"""
+                    req_lower = str(req_text).lower()
+                    # Keywords that should only appear if explicitly in job description
+                    invented_keywords = [
+                        "location", "visa", "work authorization", "security clearance", 
+                        "SC clearance", "right to work", "residency", "based in",
+                        "certification", "certified", "license", "licensed"
+                    ]
+                    for keyword in invented_keywords:
+                        if keyword in req_lower:
+                            # Check if keyword appears in job description
+                            if keyword not in job_description_text.lower():
+                                logger.warning(f"Filtering out invented requirement: {req_text} (keyword '{keyword}' not in job description)")
+                                return True
+                    # Special check: If requirement says "no specific X required" or "not mentioned", it's invented
+                    if "no specific" in req_lower or ("not mentioned" in req_lower and "candidate" not in req_lower) or "not required" in req_lower:
+                        logger.warning(f"Filtering out invented requirement: {req_text} (contains 'no specific' or 'not mentioned')")
+                        return True
+                    return False
+                
+                # Filter out invented requirements from all lists
+                original_satisfied_count = len(requirements_satisfied_list)
+                original_missing_count = len(requirements_missing_list)
+                original_partial_count = len(requirements_partially_met_list)
+                
+                requirements_satisfied_list = [r for r in requirements_satisfied_list if not is_invented_requirement(r)]
+                requirements_missing_list = [r for r in requirements_missing_list if not is_invented_requirement(r)]
+                requirements_partially_met_list = [r for r in requirements_partially_met_list if not is_invented_requirement(r)]
+                
+                filtered_count = (original_satisfied_count - len(requirements_satisfied_list)) + \
+                                (original_missing_count - len(requirements_missing_list)) + \
+                                (original_partial_count - len(requirements_partially_met_list))
+                if filtered_count > 0:
+                    logger.info(f"Filtered out {filtered_count} invented requirement(s) for job {idx}")
+                
+                # Post-processing: Fix education classification - degree in progress should be PARTIALLY_MET, not NOT_MET
+                def fix_education_classification(req_text, candidate_profile):
+                    """Fix education requirements that should be PARTIALLY_MET"""
+                    req_lower = str(req_text).lower()
+                    if "education" in req_lower or "degree" in req_lower or "bachelor" in req_lower or "master" in req_lower:
+                        # Check if candidate is pursuing degree
+                        education = candidate_profile.get("education", []) or []
+                        for edu in education:
+                            dates = str(edu.get("dates", "")).lower()
+                            degree = str(edu.get("degree", "")).lower()
+                            # Check if degree is in progress (future dates, "present", "expected")
+                            if any(indicator in dates for indicator in ["2027", "2028", "2029", "2030", "present", "expected", "pursuing"]):
+                                if "not met" in req_lower and ("bachelor" in degree or "master" in degree or "phd" in degree):
+                                    logger.warning(f"Fixing education classification: {req_text} should be PARTIALLY_MET (degree in progress)")
+                                    return True
+                    return False
+                
+                # Move incorrectly classified education requirements from missing to partially_met
+                education_to_move = []
+                for item in requirements_missing_list:
+                    if fix_education_classification(item, candidate_profile):
+                        education_to_move.append(item)
+                
+                for item in education_to_move:
+                    requirements_missing_list.remove(item)
+                    if item not in requirements_partially_met_list:
+                        # Update the status in the text
+                        updated_item = item.replace("NOT MET", "PARTIALLY MET").replace("not met", "PARTIALLY MET")
+                        if "degree" in updated_item.lower() and "pursuing" not in updated_item.lower() and "in progress" not in updated_item.lower():
+                            # Add context about degree in progress
+                            if "candidate" in updated_item.lower():
+                                updated_item = updated_item.replace("candidate", "candidate is pursuing").replace("has", "is pursuing")
+                            else:
+                                updated_item = updated_item + " (candidate is pursuing degree)"
+                        requirements_partially_met_list.append(updated_item)
+                        logger.info(f"Moved education requirement from missing to partially_met: {item}")
+                
+                # Post-processing: Fix preferred skills classification
+                def fix_preferred_skill_classification(req_text, candidate_profile):
+                    """Fix preferred skills that should be PARTIALLY_MET when candidate has them"""
+                    req_lower = str(req_text).lower()
+                    # Check if this is about a preferred skill
+                    if "preferred" in req_lower or "nice to have" in req_lower:
+                        # Extract skill name from requirement text and check candidate skills
+                        candidate_skills = [s.lower() for s in (candidate_profile.get("skills", []) or [])]
+                        # Check if any candidate skill matches (including variations)
+                        for skill in candidate_skills:
+                            # Check for skill name in requirement text
+                            if skill in req_lower or any(variation in req_lower for variation in [skill + ".js", skill + "js", skill.replace(" ", "")]):
+                                if "not met" in req_lower:
+                                    logger.warning(f"Fixing preferred skill classification: {req_text} should be PARTIALLY_MET (candidate has preferred skill: {skill})")
+                                    return True
+                    return False
+                
+                # Move incorrectly classified preferred skills from missing to partially_met
+                preferred_skills_to_move = []
+                for item in requirements_missing_list:
+                    if fix_preferred_skill_classification(item, candidate_profile):
+                        preferred_skills_to_move.append(item)
+                
+                for item in preferred_skills_to_move:
+                    requirements_missing_list.remove(item)
+                    if item not in requirements_partially_met_list:
+                        # Update the status in the text
+                        updated_item = item.replace("NOT MET", "PARTIALLY MET").replace("not met", "PARTIALLY MET")
+                        if "preferred" not in updated_item.lower() and "nice to have" not in updated_item.lower():
+                            updated_item = updated_item + " (preferred skill matched)"
+                        requirements_partially_met_list.append(updated_item)
+                        logger.info(f"Moved preferred skill from missing to partially_met: {item}")
                 
                 # Post-processing: Fix misclassified requirements
                 # Move any items from requirements_satisfied that indicate the candidate doesn't have them
@@ -2338,18 +2466,36 @@ FINAL REMINDERS:
                     if item not in requirements_missing_list:
                         requirements_missing_list.append(item)
                 
-                requirements_met = int(data_result.get("requirements_met", 0))
+                # STRICT SCORING: Only MET counts, PARTIALLY_MET does NOT count as met
+                # PARTIALLY_MET is tracked separately but does not contribute to match score
+                requirements_met = len(requirements_satisfied_list)  # Only fully met requirements count
                 total_requirements = int(data_result.get("total_requirements", 0))
                 
                 # Update requirements_met count if items were moved
                 if items_to_move:
-                    # Recalculate requirements_met based on actual satisfied list
+                    # Recalculate requirements_met - only fully satisfied count
                     requirements_met = len(requirements_satisfied_list)
                     logger.info(f"Adjusted requirements_met from {data_result.get('requirements_met', 0)} to {requirements_met} after fixing misclassifications")
                 
+                # VALIDATION: Ensure total_requirements matches the sum of satisfied + missing + partially met
+                actual_total = len(requirements_satisfied_list) + len(requirements_missing_list) + len(requirements_partially_met_list)
+                if total_requirements != actual_total and actual_total > 0:
+                    logger.warning(f"Total requirements mismatch for job {idx}: declared={total_requirements}, actual={actual_total}. Adjusting total_requirements to match actual count.")
+                    total_requirements = actual_total
+                    # Also update requirements_met to match calculated value
+                    requirements_met_raw = len(requirements_satisfied_list) + (0.5 * len(requirements_partially_met_list))
+                    requirements_met = int(round(requirements_met_raw))
+                
+                # VALIDATION: Ensure requirements_met matches the count of fully satisfied requirements
+                # PARTIALLY_MET does NOT count toward requirements_met
+                expected_met = len(requirements_satisfied_list)
+                if requirements_met != expected_met:
+                    logger.warning(f"Requirements met mismatch for job {idx}: declared={requirements_met}, expected={expected_met}. Adjusting requirements_met to match satisfied count.")
+                    requirements_met = expected_met
+                
                 # Fallback: If no requirements extracted AND description is empty/sparse, use minimal fallback
                 # NOTE: This fallback should be VERY conservative - only use if description is truly empty
-                if total_requirements == 0 and len(requirements_satisfied_list) == 0 and len(requirements_missing_list) == 0:
+                if total_requirements == 0 and len(requirements_satisfied_list) == 0 and len(requirements_missing_list) == 0 and len(requirements_partially_met_list) == 0:
                     # Only use fallback if description is missing or very short (less than 50 chars)
                     description_available = job_description_text and len(job_description_text.strip()) > 50
                     
@@ -2403,14 +2549,40 @@ FINAL REMINDERS:
                         total_requirements = 1
                         requirements_met = 0
                 
+                # Final validation: Ensure consistency
                 if total_requirements == 0:
-                    total_requirements = len(requirements_satisfied_list) + len(requirements_missing_list)
+                    # Recalculate from actual lists
+                    total_requirements = len(requirements_satisfied_list) + len(requirements_missing_list) + len(requirements_partially_met_list)
                     if total_requirements == 0:
-                        total_requirements = 1
-                    requirements_met = len(requirements_satisfied_list)
+                        # Only set to 1 if description is truly empty
+                        if not job_description_text or len(job_description_text.strip()) <= 50:
+                            total_requirements = 1
+                        else:
+                            # Description exists but no requirements extracted - this is a problem
+                            logger.error(f"CRITICAL: Description available ({len(job_description_text)} chars) but no requirements extracted for job {idx}. This indicates extraction failure.")
+                            total_requirements = 1  # Set to 1 to avoid division by zero, but log error
+                    requirements_met_raw = len(requirements_satisfied_list) + (0.5 * len(requirements_partially_met_list))
+                    requirements_met = int(round(requirements_met_raw))
+                
+                # Final consistency check: total should equal satisfied + missing + partially met
+                actual_total = len(requirements_satisfied_list) + len(requirements_missing_list) + len(requirements_partially_met_list)
+                if total_requirements != actual_total and actual_total > 0:
+                    logger.warning(f"Final validation: Total requirements mismatch for job {idx}: declared={total_requirements}, actual={actual_total}. Correcting to actual count.")
+                    total_requirements = actual_total
+                
+                # Final consistency check: requirements_met should equal satisfied count only
+                # PARTIALLY_MET does NOT count toward requirements_met
+                expected_met = len(requirements_satisfied_list)
+                if requirements_met != expected_met:
+                    logger.warning(f"Final validation: Requirements met mismatch for job {idx}: declared={requirements_met}, expected={expected_met}. Correcting to satisfied count only.")
+                    requirements_met = expected_met
                 
                 if requirements_met > total_requirements:
+                    logger.warning(f"Requirements met ({requirements_met}) exceeds total requirements ({total_requirements}) for job {idx}. Capping to total.")
                     requirements_met = total_requirements
+                
+                # Log final validation summary
+                logger.info(f"Job {idx} requirements validation: total={total_requirements}, satisfied={len(requirements_satisfied_list)}, partially_met={len(requirements_partially_met_list)}, missing={len(requirements_missing_list)}, met={requirements_met}")
                 
                 # Extract reasoning separately (needed for logging)
                 reasoning = data_result.get("reasoning", "Score calculated based on candidate-job alignment")
@@ -2439,6 +2611,7 @@ FINAL REMINDERS:
                     "requirements_met": requirements_met,
                     "total_requirements": total_requirements,
                     "requirements_satisfied": requirements_satisfied_list,
+                    "requirements_partially_met": requirements_partially_met_list,
                     "requirements_missing": requirements_missing_list,
                     "improvements_needed": data_result.get("improvements_needed", []) or [],
                     "reasoning": data_result.get("reasoning", "Score calculated based on candidate-job alignment"),
@@ -2464,6 +2637,7 @@ FINAL REMINDERS:
                         "requirements_met": requirements_met,
                         "total_requirements": total_requirements,
                         "requirements_satisfied": requirements_satisfied_list,
+                        "requirements_partially_met": requirements_partially_met_list,
                         "requirements_missing": requirements_missing_list,
                         "improvements_needed": data_result.get("improvements_needed", []) or [],
                         "summary": summary_text,
@@ -2487,6 +2661,7 @@ FINAL REMINDERS:
                     "summary": summary_text,
                     "key_matches": key_matches,  # Send all key matches, not just first 5
                     "requirements_satisfied": requirements_satisfied_list,
+                    "requirements_partially_met": requirements_partially_met_list,
                     "requirements_missing": requirements_missing_list,
                     "improvements_needed": data_result.get("improvements_needed", []) or [],
                     "location": None,  # Location extraction happens later if needed
@@ -2536,6 +2711,7 @@ FINAL REMINDERS:
                     "summary": summary_text,
                     "key_matches": entry["key_matches"],
                     "requirements_satisfied": entry["requirements_satisfied"],
+                    "requirements_partially_met": entry.get("requirements_partially_met", []),
                     "requirements_missing": entry["requirements_missing"],
                     "improvements_needed": entry["improvements_needed"],
                     "location": None,
@@ -2546,9 +2722,14 @@ FINAL REMINDERS:
             
             # Check sponsorship
             sponsorship_info = None
+            # Always check for sponsorship mentions and SC clearance in job description
+            from sponsorship_checker import check_sponsorship, check_sponsorship_in_job_description, check_sc_clearance_requirement
+            job_description = jobs[0].description if jobs and jobs[0].description else None
+            sponsorship_mentioned = check_sponsorship_in_job_description(job_description)
+            sc_clearance_required = check_sc_clearance_requirement(job_description)
+            
             if jobs and jobs[0].company:
                 logger.info(f"Checking sponsorship for company: {jobs[0].company}")
-                from sponsorship_checker import check_sponsorship
                 cleaned_name = clean_company_name(jobs[0].company)
                 if cleaned_name:
                     try:
@@ -2560,7 +2741,9 @@ FINAL REMINDERS:
                                 "company_name": sponsorship_result.get("company_name"),
                                 "sponsors_workers": sponsorship_result.get("sponsors_workers", False),
                                 "visa_types": sponsorship_result.get("visa_types"),
-                                "summary": sponsorship_result.get("summary", "No sponsorship information available")
+                                "summary": sponsorship_result.get("summary", "No sponsorship information available"),
+                                "sponsorship_mentioned_in_job": sponsorship_result.get("sponsorship_mentioned_in_job"),
+                                "sc_clearance_required": sponsorship_result.get("sc_clearance_required")
                             }
                             
                             # Event 8: Sponsorship result - stream complete sponsorship data
@@ -2581,7 +2764,9 @@ FINAL REMINDERS:
                                 "company_name": sponsorship_info.get("company_name"),
                                 "sponsors_workers": sponsorship_info.get("sponsors_workers", False),
                                 "visa_types": sponsorship_info.get("visa_types"),
-                                "summary": sponsorship_info.get("summary", "No sponsorship information available")
+                                "summary": sponsorship_info.get("summary", "No sponsorship information available"),
+                                "sponsorship_mentioned_in_job": sponsorship_info.get("sponsorship_mentioned_in_job"),
+                                "sc_clearance_required": sponsorship_info.get("sc_clearance_required")
                             })
                             await asyncio.sleep(0)  # Force flush - CRITICAL for SSE
                             logger.info("sponsorship_checked event with full data yielded successfully")
@@ -2589,13 +2774,25 @@ FINAL REMINDERS:
                         logger.error(f"Sponsorship check failed: {e}", exc_info=True)
                         logger.info(f"Yielding sponsorship_checked event (error case) for company: {cleaned_name}")
                         
+                        # Use already checked sponsorship and SC clearance values
+                        
+                        summary_parts = [f"Error checking sponsorship: {str(e)}"]
+                        if sponsorship_mentioned['mentioned']:
+                            summary_parts.append('Sponsorship details are mentioned in the job description.')
+                        else:
+                            summary_parts.append('Sponsorship details are not mentioned in the job description.')
+                        if sc_clearance_required['required']:
+                            summary_parts.append('SC clearance is required.')
+                        
                         # Write sponsorship error to file
                         if response_file:
                             error_sponsorship_info = {
                                 "company_name": cleaned_name,
                                 "sponsors_workers": False,
                                 "visa_types": None,
-                                "summary": f"Error checking sponsorship: {str(e)}"
+                                "summary": ' '.join(summary_parts),
+                                "sponsorship_mentioned_in_job": sponsorship_mentioned['mentioned'],
+                                "sc_clearance_required": sc_clearance_required['required']
                             }
                             response_file.write(f"=== SPONSORSHIP CHECK RESULT (ERROR) ===\n")
                             response_file.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -2610,11 +2807,33 @@ FINAL REMINDERS:
                             "company_name": cleaned_name,
                             "sponsors_workers": False,
                             "visa_types": None,
-                            "summary": f"Error checking sponsorship: {str(e)}"
+                            "summary": ' '.join(summary_parts),
+                            "sponsorship_mentioned_in_job": sponsorship_mentioned['mentioned'],
+                            "sc_clearance_required": sc_clearance_required['required']
                         }
                         yield format_sse_event("sponsorship_checked", error_sponsorship_data)
                         await asyncio.sleep(0)  # Force flush - CRITICAL for SSE
                         logger.info("sponsorship_checked event (error case) with full data yielded successfully")
+            else:
+                # No company found, but still check for sponsorship mentions and SC clearance
+                if job_description:
+                    summary_parts = []
+                    if sponsorship_mentioned['mentioned']:
+                        summary_parts.append('Sponsorship details are mentioned in the job description.')
+                    else:
+                        summary_parts.append('Sponsorship details are not mentioned in the job description.')
+                    if sc_clearance_required['required']:
+                        summary_parts.append('SC clearance is required.')
+                    
+                    if summary_parts:
+                        sponsorship_info = {
+                            "company_name": None,
+                            "sponsors_workers": False,
+                            "visa_types": None,
+                            "summary": ' '.join(summary_parts),
+                            "sponsorship_mentioned_in_job": sponsorship_mentioned['mentioned'],
+                            "sc_clearance_required": sc_clearance_required['required']
+                        }
             
             # Event 9: Summary generation (stream summaries if needed)
             # For now, summaries are already created, but we can stream them if needed
@@ -3148,7 +3367,9 @@ async def check_sponsorship_endpoint(
             company_name=sponsorship_result.get('company_name'),
             sponsors_workers=sponsorship_result.get('sponsors_workers', False),
             visa_types=sponsorship_result.get('visa_types'),
-            summary=enhanced_summary
+            summary=enhanced_summary,
+            sponsorship_mentioned_in_job=sponsorship_result.get('sponsorship_mentioned_in_job'),
+            sc_clearance_required=sponsorship_result.get('sc_clearance_required')
         )
         
     except FileNotFoundError as e:

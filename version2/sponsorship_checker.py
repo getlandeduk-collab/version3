@@ -724,6 +724,82 @@ Return ONLY the JSON, no markdown, no explanations."""
         }
 
 
+def check_sponsorship_in_job_description(job_content: Optional[str]) -> Dict[str, bool]:
+    """
+    Check if the job description explicitly mentions sponsorship details.
+    
+    Args:
+        job_content: Job posting content text
+        
+    Returns:
+        Dictionary with 'mentioned' (bool) indicating if sponsorship is mentioned
+    """
+    if not job_content:
+        return {'mentioned': False}
+    
+    # Patterns to detect sponsorship mentions
+    sponsorship_patterns = [
+        r'\bvisa\s+sponsorship\b',
+        r'\bsponsor\s+visa\b',
+        r'\bsponsor\s+work\s+visa\b',
+        r'\bwork\s+visa\s+sponsorship\b',
+        r'\bsponsor\s+.*visa\b',
+        r'\bvisa\s+sponsor\b',
+        r'\bsponsorship\s+available\b',
+        r'\bwill\s+sponsor\b',
+        r'\bcan\s+sponsor\b',
+        r'\bsponsor\s+.*work\s+permit\b',
+        r'\bwork\s+permit\s+sponsorship\b',
+        r'\bskilled\s+worker\s+visa\b',
+        r'\btier\s+2\s+visa\b',
+        r'\bsponsor\s+.*tier\s+2\b',
+    ]
+    
+    content_lower = job_content.lower()
+    for pattern in sponsorship_patterns:
+        if re.search(pattern, content_lower, re.IGNORECASE):
+            return {'mentioned': True}
+    
+    return {'mentioned': False}
+
+
+def check_sc_clearance_requirement(job_content: Optional[str]) -> Dict[str, bool]:
+    """
+    Check if SC clearance (Security Clearance) is mentioned in the job posting.
+    
+    Args:
+        job_content: Job posting content text
+        
+    Returns:
+        Dictionary with 'required' (bool) indicating if SC clearance is required
+    """
+    if not job_content:
+        return {'required': False}
+    
+    # Patterns to detect SC clearance mentions
+    sc_clearance_patterns = [
+        r'\bSC\s+clearance\b',
+        r'\bsecurity\s+clearance\b',
+        r'\bSC\s+required\b',
+        r'\bsecurity\s+clearance\s+required\b',
+        r'\bmust\s+have\s+SC\s+clearance\b',
+        r'\bmust\s+hold\s+SC\s+clearance\b',
+        r'\bSC\s+clearance\s+essential\b',
+        r'\bSC\s+clearance\s+mandatory\b',
+        r'\bSC\s+clearance\s+needed\b',
+        r'\bSC\s+cleared\b',
+        r'\bsecurity\s+cleared\b',
+        r'\bSC\s+status\b',
+    ]
+    
+    content_lower = job_content.lower()
+    for pattern in sc_clearance_patterns:
+        if re.search(pattern, content_lower, re.IGNORECASE):
+            return {'required': True}
+    
+    return {'required': False}
+
+
 def check_sponsorship(company_name: Optional[str], job_content: Optional[str] = None, openai_api_key: Optional[str] = None) -> Dict[str, Any]:
     """
     Check if a company sponsors workers by looking it up in the CSV.
@@ -738,16 +814,31 @@ def check_sponsorship(company_name: Optional[str], job_content: Optional[str] = 
         Dictionary with sponsorship information
     """
     try:
+        # Check for sponsorship mentions and SC clearance in job description
+        sponsorship_mentioned = check_sponsorship_in_job_description(job_content)
+        sc_clearance_required = check_sc_clearance_requirement(job_content)
+        
         # Extract company name if not provided
         if not company_name:
             company_name = extract_company_name(job_content or "")
         
         if not company_name:
+            # Still return sponsorship and SC clearance info even if company name not found
+            summary_parts = ['Company name could not be extracted from job posting.']
+            if sponsorship_mentioned['mentioned']:
+                summary_parts.append('Sponsorship details are mentioned in the job description.')
+            else:
+                summary_parts.append('Sponsorship details are not mentioned in the job description.')
+            if sc_clearance_required['required']:
+                summary_parts.append('SC clearance is required.')
+            
             return {
                 'company_name': None,
                 'sponsors_workers': False,
                 'visa_types': None,
-                'summary': 'Company name could not be extracted from job posting.'
+                'summary': ' '.join(summary_parts),
+                'sponsorship_mentioned_in_job': sponsorship_mentioned['mentioned'],
+                'sc_clearance_required': sc_clearance_required['required']
             }
         
         # Load CSV data (cached, loads once)
@@ -773,14 +864,28 @@ def check_sponsorship(company_name: Optional[str], job_content: Optional[str] = 
                 exact_match = None
             else:
                 # Exact match verified - return it
-                summary = f"{csv_company_name} is a registered UK visa sponsor. Visa Routes: {exact_match.get('Type & Rating', '')}."
+                summary_parts = [f"{csv_company_name} is a registered UK visa sponsor. Visa Routes: {exact_match.get('Type & Rating', '')}."]
+                
+                # Add sponsorship mention status
+                if sponsorship_mentioned['mentioned']:
+                    summary_parts.append('Sponsorship details are mentioned in the job description.')
+                else:
+                    summary_parts.append('Sponsorship details are not mentioned in the job description.')
+                
+                # Add SC clearance requirement
+                if sc_clearance_required['required']:
+                    summary_parts.append('SC clearance is required.')
+                
+                summary = ' '.join(summary_parts)
                 
                 return {
                     'company_name': csv_company_name,
                     'sponsors_workers': True,
                     'visa_types': exact_match.get('Type & Rating', ''),
                     'summary': summary,
-                    'verification': verification_result
+                    'verification': verification_result,
+                    'sponsorship_mentioned_in_job': sponsorship_mentioned['mentioned'],
+                    'sc_clearance_required': sc_clearance_required['required']
                 }
         
         # Fallback to fuzzy matching if no exact match (or exact match was rejected)
@@ -809,14 +914,24 @@ def check_sponsorship(company_name: Optional[str], job_content: Optional[str] = 
                 # STRICT: Reject the match if LLM verification fails
                 if not verification_result.get('verified', True):
                     logger.warning(f"LLM verification REJECTED fuzzy match: '{company_name}' vs '{csv_company_name}' (confidence: {verification_result.get('confidence', 'low')}, reason: {verification_result.get('reasoning', 'N/A')})")
-                    # Treat as no match found
+                    # Treat as no match found, but still include sponsorship and SC clearance info
+                    summary_parts = [f"{company_name} was not found in the UK visa sponsorship database. The AI agent reviewed similar company names but determined none match."]
+                    if sponsorship_mentioned['mentioned']:
+                        summary_parts.append('Sponsorship details are mentioned in the job description.')
+                    else:
+                        summary_parts.append('Sponsorship details are not mentioned in the job description.')
+                    if sc_clearance_required['required']:
+                        summary_parts.append('SC clearance is required.')
+                    
                     return {
                         'company_name': company_name,
                         'sponsors_workers': False,
                         'visa_types': None,
-                        'summary': f"{company_name} was not found in the UK visa sponsorship database. The AI agent reviewed similar company names but determined none match.",
+                        'summary': ' '.join(summary_parts),
                         'found_in_csv': False,
-                        'verification': verification_result
+                        'verification': verification_result,
+                        'sponsorship_mentioned_in_job': sponsorship_mentioned['mentioned'],
+                        'sc_clearance_required': sc_clearance_required['required']
                     }
                 
                 # Match verified - return it
@@ -829,6 +944,16 @@ def check_sponsorship(company_name: Optional[str], job_content: Optional[str] = 
                 if selected_match.get('locations'):
                     summary_parts.append(f"Location(s): {selected_match['locations']}.")
                 
+                # Add sponsorship mention status
+                if sponsorship_mentioned['mentioned']:
+                    summary_parts.append('Sponsorship details are mentioned in the job description.')
+                else:
+                    summary_parts.append('Sponsorship details are not mentioned in the job description.')
+                
+                # Add SC clearance requirement
+                if sc_clearance_required['required']:
+                    summary_parts.append('SC clearance is required.')
+                
                 summary = " ".join(summary_parts)
                 
                 logger.info(f"✓ Selected match: {csv_company_name} (score: {selected_match['match_score']}%, verified: {verification_result.get('verified', True)})")
@@ -839,45 +964,96 @@ def check_sponsorship(company_name: Optional[str], job_content: Optional[str] = 
                     'visa_types': selected_match['visa_types'],
                     'summary': summary,
                     'found_in_csv': True,
-                    'verification': verification_result
+                    'verification': verification_result,
+                    'sponsorship_mentioned_in_job': sponsorship_mentioned['mentioned'],
+                    'sc_clearance_required': sc_clearance_required['required']
                 }
             else:
                 # Agent determined none of the candidates match
                 logger.debug(f"AI agent determined none of the {len(candidate_matches)} candidates are correct")
+                summary_parts = [f"{company_name} was not found in the UK visa sponsorship database."]
+                if sponsorship_mentioned['mentioned']:
+                    summary_parts.append('Sponsorship details are mentioned in the job description.')
+                else:
+                    summary_parts.append('Sponsorship details are not mentioned in the job description.')
+                if sc_clearance_required['required']:
+                    summary_parts.append('SC clearance is required.')
+                
                 return {
                     'company_name': company_name,
                     'sponsors_workers': False,
                     'visa_types': None,
-                    'summary': f"{company_name} was not found in the UK visa sponsorship database.",
-                    'found_in_csv': False
+                    'summary': ' '.join(summary_parts),
+                    'found_in_csv': False,
+                    'sponsorship_mentioned_in_job': sponsorship_mentioned['mentioned'],
+                    'sc_clearance_required': sc_clearance_required['required']
                 }
         else:
             # No candidate matches found in CSV
             logger.debug("No candidate matches found above threshold")
+            summary_parts = [f"{company_name} was not found in the UK visa sponsorship database."]
+            if sponsorship_mentioned['mentioned']:
+                summary_parts.append('Sponsorship details are mentioned in the job description.')
+            else:
+                summary_parts.append('Sponsorship details are not mentioned in the job description.')
+            if sc_clearance_required['required']:
+                summary_parts.append('SC clearance is required.')
+            
             return {
                 'company_name': company_name,
                 'sponsors_workers': False,
                 'visa_types': None,
-                'summary': f"{company_name} was not found in the UK visa sponsorship database.",
-                'found_in_csv': False
+                'summary': ' '.join(summary_parts),
+                'found_in_csv': False,
+                'sponsorship_mentioned_in_job': sponsorship_mentioned['mentioned'],
+                'sc_clearance_required': sc_clearance_required['required']
             }
             
     except FileNotFoundError as e:
+        # Still check for sponsorship and SC clearance even if database unavailable
+        sponsorship_mentioned = check_sponsorship_in_job_description(job_content)
+        sc_clearance_required = check_sc_clearance_requirement(job_content)
+        
+        summary_parts = [f'Sponsorship database not available: {str(e)}']
+        if sponsorship_mentioned['mentioned']:
+            summary_parts.append('Sponsorship details are mentioned in the job description.')
+        else:
+            summary_parts.append('Sponsorship details are not mentioned in the job description.')
+        if sc_clearance_required['required']:
+            summary_parts.append('SC clearance is required.')
+        
         return {
             'company_name': company_name or "Unknown",
             'sponsors_workers': False,
             'visa_types': None,
-            'summary': f'Sponsorship database not available: {str(e)}'
+            'summary': ' '.join(summary_parts),
+            'sponsorship_mentioned_in_job': sponsorship_mentioned['mentioned'],
+            'sc_clearance_required': sc_clearance_required['required']
         }
     except Exception as e:
         logger.error(f"Error checking sponsorship: {e}", exc_info=True)
         import traceback
         print(traceback.format_exc())
+        
+        # Still check for sponsorship and SC clearance even if error occurred
+        sponsorship_mentioned = check_sponsorship_in_job_description(job_content)
+        sc_clearance_required = check_sc_clearance_requirement(job_content)
+        
+        summary_parts = [f'Error checking sponsorship: {str(e)}']
+        if sponsorship_mentioned['mentioned']:
+            summary_parts.append('Sponsorship details are mentioned in the job description.')
+        else:
+            summary_parts.append('Sponsorship details are not mentioned in the job description.')
+        if sc_clearance_required['required']:
+            summary_parts.append('SC clearance is required.')
+        
         return {
             'company_name': company_name or "Unknown",
             'sponsors_workers': False,
             'visa_types': None,
-            'summary': f'Error checking sponsorship: {str(e)}'
+            'summary': ' '.join(summary_parts),
+            'sponsorship_mentioned_in_job': sponsorship_mentioned['mentioned'],
+            'sc_clearance_required': sc_clearance_required['required']
         }
 
 

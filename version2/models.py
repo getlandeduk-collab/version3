@@ -104,6 +104,10 @@ class MatchedJob(BaseModel):
         default_factory=list,
         description="List of specific requirements/skills that the candidate matches (e.g., 'Java', 'React', 'AWS')"
     )
+    requirements_partially_met: List[str] = Field(
+        default_factory=list,
+        description="List of specific requirements that the candidate partially meets (e.g., 'pursuing degree' when 'completed degree' is required)"
+    )
     requirements_missing: List[str] = Field(
         default_factory=list,
         description="List of specific requirements/skills that the candidate does not match (e.g., 'Kubernetes', 'Docker')"
@@ -122,6 +126,8 @@ class SponsorshipInfo(BaseModel):
     sponsors_workers: bool = False
     visa_types: Optional[str] = None
     summary: str = "No sponsorship information available"
+    sponsorship_mentioned_in_job: Optional[bool] = None
+    sc_clearance_required: Optional[bool] = None
     # Note: document_id and document_data are internal Firebase fields and should NOT be included in API responses
 
 
