@@ -7,6 +7,7 @@ import os
 import time
 import re
 import logging
+import hashlib
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
@@ -237,6 +238,10 @@ app.add_middleware(
     allow_headers=["*"],
 
 )
+
+# Resume parsing cache (hash-based)
+# Key: SHA256 hash of resume text, Value: parsed candidate profile dict
+RESUME_PARSING_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # Startup event: Preload sponsorship CSV data
 @app.on_event("startup")
@@ -1353,10 +1358,21 @@ async def match_jobs_stream(
             })
             await asyncio.sleep(0)  # Force flush
             
+            # Timing: Start PDF extraction
+            pdf_extraction_start = time.perf_counter()
+            
             # Parse resume with streaming LLM response
             logger.info("Starting resume parsing...")
             resume_text = extract_text_from_pdf_bytes(resume_bytes)
             logger.info(f"Resume text extracted, length: {len(resume_text)}")
+            
+            # Timing: End PDF extraction
+            pdf_extraction_duration = time.perf_counter() - pdf_extraction_start
+            yield format_sse_event("timing", {
+                "step": "pdf_extraction",
+                "seconds": round(pdf_extraction_duration, 3)
+            })
+            await asyncio.sleep(0)  # Force flush
             
             # Save OCR-extracted text to separate file for debugging
             ocr_text_file_path = Path(f"responses/resume_ocr_{request_id}.txt")
@@ -1376,14 +1392,67 @@ async def match_jobs_stream(
             model_name = settings.model_name or "gpt-4o-mini"
             logger.info(f"Starting streaming LLM parsing with model: {model_name}")
             
-            # Stream LLM response for resume parsing
-            try:
-                from openai import OpenAI
-                import json as json_lib
+            # Check resume parsing cache
+            resume_hash = hashlib.sha256(resume_text.encode('utf-8')).hexdigest()
+            logger.info(f"Resume hash: {resume_hash[:16]}...")
+            
+            if resume_hash in RESUME_PARSING_CACHE:
+                logger.info("✅ Resume found in cache, using cached result")
+                yield format_sse_event("status", {
+                    "message": "Resume found in cache, using cached parsing result..."
+                })
+                await asyncio.sleep(0)  # Force flush
                 
-                client = OpenAI(api_key=openai_key)
+                # Timing: Cache hit
+                yield format_sse_event("timing", {
+                    "step": "resume_parsing",
+                    "seconds": 0.001,
+                    "cached": True
+                })
+                await asyncio.sleep(0)  # Force flush
                 
-                resume_prompt = f"""You are extracting structured data from a resume. Read the ENTIRE resume text below and extract information accurately.
+                candidate_profile = RESUME_PARSING_CACHE[resume_hash].copy()
+                
+                # Send cached resume_parsed event
+                candidate_profile_response = {
+                    "name": candidate_profile.get("name"),
+                    "email": candidate_profile.get("email"),
+                    "phone": candidate_profile.get("phone"),
+                    "skills": candidate_profile.get("skills", []) if isinstance(candidate_profile.get("skills"), list) else [],
+                    "experience_summary": candidate_profile.get("experience_summary"),
+                    "experience_breakdown": candidate_profile.get("experience_breakdown", {
+                        "full_time": "0 months",
+                        "internship": "0 months",
+                        "freelance": "0 months",
+                        "part_time": "0 months",
+                        "contract": "0 months",
+                        "academic": "0 months",
+                        "total": "0 months"
+                    }),
+                    "education": candidate_profile.get("education", []),
+                    "certifications": candidate_profile.get("certifications", []),
+                    "interests": candidate_profile.get("interests", []),
+                    "raw_text_excerpt": candidate_profile.get("raw_text_excerpt")
+                }
+                yield format_sse_event("resume_parsed", {
+                    "candidate_profile": candidate_profile_response
+                })
+                await asyncio.sleep(0)  # Force flush
+                logger.info("✅ Cached resume_parsed event sent")
+            else:
+                logger.info("Resume not in cache, parsing with LLM...")
+                
+                # Timing: Start resume parsing
+                resume_parsing_start = time.perf_counter()
+            
+                # Stream LLM response for resume parsing
+                try:
+                    from openai import OpenAI
+                    import json as json_lib
+                    
+                    client = OpenAI(api_key=openai_key)
+                    
+                    resume_prompt = f"""You are extracting structured data from a resume. Read the ENTIRE resume text below and extract information accurately.
 
 RESUME TEXT (OCR-extracted from PDF):
 {resume_text}
@@ -1582,91 +1651,197 @@ REMEMBER:
 - Read the resume carefully and create a holistic professional summary
 
 Return ONLY valid JSON, no markdown formatting."""
-                
-                # Parse resume with LLM (with retry logic and optimized for speed)
-                logger.info("Calling LLM for resume parsing...")
-                
-                def call_llm_sync_with_retry(max_retries=3, initial_delay=1.0):
-                    """Call OpenAI API synchronously with retry logic"""
-                    for attempt in range(max_retries):
-                        try:
-                            logger.info(f"Making OpenAI API call (attempt {attempt + 1}/{max_retries})...")
-                            response = client.chat.completions.create(
-                                model=model_name,
-                                messages=[{"role": "user", "content": resume_prompt}],
-                                response_format={"type": "json_object"} if "gpt-4" in model_name.lower() or ("o1" in model_name.lower() and "gpt-5" not in model_name.lower()) else None,
-                                timeout=30.0  # 30 second timeout per request
+                    
+                    # Parse resume with LLM (with retry logic and optimized for speed)
+                    logger.info("Calling LLM for resume parsing...")
+                    
+                    def call_llm_sync_with_retry(max_retries=3, initial_delay=1.0):
+                        """Call OpenAI API synchronously with retry logic"""
+                        for attempt in range(max_retries):
+                            try:
+                                logger.info(f"Making OpenAI API call (attempt {attempt + 1}/{max_retries})...")
+                                response = client.chat.completions.create(
+                                    model=model_name,
+                                    messages=[{"role": "user", "content": resume_prompt}],
+                                    response_format={"type": "json_object"} if "gpt-4" in model_name.lower() or ("o1" in model_name.lower() and "gpt-5" not in model_name.lower()) else None,
+                                    timeout=30.0  # 30 second timeout per request
+                                )
+                                logger.info("OpenAI API call completed")
+                                if not response or not response.choices or len(response.choices) == 0:
+                                    logger.error("Empty response from OpenAI API")
+                                    raise Exception("Empty response from OpenAI API")
+                                if not response.choices[0].message or not response.choices[0].message.content:
+                                    logger.error("No content in OpenAI response")
+                                    raise Exception("No content in OpenAI response")
+                                response_text = response.choices[0].message.content.strip()
+                                logger.info(f"Response received, length: {len(response_text)}")
+                                if not response_text:
+                                    logger.error("Empty response text after stripping")
+                                    raise Exception("Empty response text")
+                                return response_text
+                            except Exception as e:
+                                if attempt < max_retries - 1:
+                                    delay = initial_delay * (2 ** attempt)  # Exponential backoff
+                                    logger.warning(f"OpenAI API call failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {delay}s...")
+                                    import time
+                                    time.sleep(delay)
+                                else:
+                                    logger.error(f"OpenAI API call failed after {max_retries} attempts: {e}", exc_info=True)
+                                    raise
+                    
+                    # Run LLM call in thread with shorter timeout
+                    logger.info("Starting LLM call in background thread...")
+                    full_response = None
+                    try:
+                        # Use asyncio.to_thread if available (Python 3.9+), otherwise use run_in_executor
+                        if hasattr(asyncio, 'to_thread'):
+                            logger.info("Using asyncio.to_thread...")
+                            full_response = await asyncio.wait_for(
+                                asyncio.to_thread(call_llm_sync_with_retry),
+                                timeout=60.0  # 1 minute timeout (reduced from 2 minutes)
                             )
-                            logger.info("OpenAI API call completed")
-                            if not response or not response.choices or len(response.choices) == 0:
-                                logger.error("Empty response from OpenAI API")
-                                raise Exception("Empty response from OpenAI API")
-                            if not response.choices[0].message or not response.choices[0].message.content:
-                                logger.error("No content in OpenAI response")
-                                raise Exception("No content in OpenAI response")
-                            response_text = response.choices[0].message.content.strip()
-                            logger.info(f"Response received, length: {len(response_text)}")
-                            if not response_text:
-                                logger.error("Empty response text after stripping")
-                                raise Exception("Empty response text")
-                            return response_text
-                        except Exception as e:
-                            if attempt < max_retries - 1:
-                                delay = initial_delay * (2 ** attempt)  # Exponential backoff
-                                logger.warning(f"OpenAI API call failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {delay}s...")
-                                import time
-                                time.sleep(delay)
-                            else:
-                                logger.error(f"OpenAI API call failed after {max_retries} attempts: {e}", exc_info=True)
-                                raise
-                
-                # Run LLM call in thread with shorter timeout
-                logger.info("Starting LLM call in background thread...")
-                full_response = None
-                try:
-                    # Use asyncio.to_thread if available (Python 3.9+), otherwise use run_in_executor
-                    if hasattr(asyncio, 'to_thread'):
-                        logger.info("Using asyncio.to_thread...")
-                        full_response = await asyncio.wait_for(
-                            asyncio.to_thread(call_llm_sync_with_retry),
-                            timeout=60.0  # 1 minute timeout (reduced from 2 minutes)
-                        )
+                        else:
+                            logger.info("Using run_in_executor (Python < 3.9)...")
+                            loop = asyncio.get_event_loop()
+                            full_response = await asyncio.wait_for(
+                                loop.run_in_executor(None, call_llm_sync_with_retry),
+                                timeout=60.0  # 1 minute timeout
+                            )
+                        logger.info(f"✅ LLM response received, total length: {len(full_response)}")
+                        if not full_response or len(full_response) == 0:
+                            logger.error("Empty response from LLM")
+                            raise Exception("Empty response from LLM")
+                    except asyncio.TimeoutError:
+                        logger.error("LLM call timed out after 60 seconds")
+                        raise Exception("Resume parsing timed out")
+                    except Exception as llm_error:
+                        logger.error(f"Error getting LLM response: {llm_error}", exc_info=True)
+                        raise llm_error
+                    
+                    # Parse the JSON response IMMEDIATELY (before any file operations)
+                    logger.info(f"✅ Starting JSON parsing, response length: {len(full_response)}")
+                    await asyncio.sleep(0)  # Yield before parsing
+                    
+                    from agents import extract_json_from_response
+                    candidate_profile = extract_json_from_response(full_response)
+                    logger.info(f"✅ JSON parsing complete, candidate_profile type: {type(candidate_profile)}")
+                    
+                    # Timing: End resume parsing
+                    resume_parsing_duration = time.perf_counter() - resume_parsing_start
+                    yield format_sse_event("timing", {
+                        "step": "resume_parsing",
+                        "seconds": round(resume_parsing_duration, 3),
+                        "cached": False
+                    })
+                    await asyncio.sleep(0)  # Force flush
+                    
+                    # Validate and fix candidate_profile with comprehensive fallbacks
+                    if not candidate_profile or not isinstance(candidate_profile, dict):
+                        logger.warning("Failed to extract JSON from resume parsing response, using fallback")
+                        candidate_profile = {
+                            "name": "Unknown Candidate",
+                            "email": None,
+                            "phone": None,
+                            "skills": [],
+                            "experience_summary": resume_text[:500] if resume_text else "",
+                            "experience_breakdown": {
+                                "full_time": "0 months",
+                                "internship": "0 months",
+                                "freelance": "0 months",
+                                "part_time": "0 months",
+                                "contract": "0 months",
+                                "academic": "0 months",
+                                "total": "0 months"
+                            },
+                            "total_years_experience": 0.0,  # For internal scoring only
+                            "education": [],
+                            "certifications": [],
+                            "interests": []
+                        }
                     else:
-                        logger.info("Using run_in_executor (Python < 3.9)...")
-                        loop = asyncio.get_event_loop()
-                        full_response = await asyncio.wait_for(
-                            loop.run_in_executor(None, call_llm_sync_with_retry),
-                            timeout=60.0  # 1 minute timeout
-                        )
-                    logger.info(f"✅ LLM response received, total length: {len(full_response)}")
-                    if not full_response or len(full_response) == 0:
-                        logger.error("Empty response from LLM")
-                        raise Exception("Empty response from LLM")
-                except asyncio.TimeoutError:
-                    logger.error("LLM call timed out after 60 seconds")
-                    raise Exception("Resume parsing timed out")
-                except Exception as llm_error:
-                    logger.error(f"Error getting LLM response: {llm_error}", exc_info=True)
-                    raise llm_error
-                
-                # Parse the JSON response IMMEDIATELY (before any file operations)
-                logger.info(f"✅ Starting JSON parsing, response length: {len(full_response)}")
-                await asyncio.sleep(0)  # Yield before parsing
-                
-                from agents import extract_json_from_response
-                candidate_profile = extract_json_from_response(full_response)
-                logger.info(f"✅ JSON parsing complete, candidate_profile type: {type(candidate_profile)}")
-                
-                # Validate and fix candidate_profile with comprehensive fallbacks
-                if not candidate_profile or not isinstance(candidate_profile, dict):
-                    logger.warning("Failed to extract JSON from resume parsing response, using fallback")
-                    candidate_profile = {
-                        "name": "Unknown Candidate",
-                        "email": None,
-                        "phone": None,
-                        "skills": [],
-                        "experience_summary": resume_text[:500] if resume_text else "",
-                        "experience_breakdown": {
+                        # Validate and ensure all required fields exist with correct types
+                        if "skills" not in candidate_profile or not isinstance(candidate_profile.get("skills"), list):
+                            logger.warning("Skills field missing or invalid, initializing empty list")
+                            candidate_profile["skills"] = []
+                        if "experience_summary" not in candidate_profile or not isinstance(candidate_profile.get("experience_summary"), str):
+                            logger.warning("experience_summary missing or invalid, using resume text excerpt")
+                            candidate_profile["experience_summary"] = resume_text[:500] if resume_text else ""
+                        
+                        # Process experience entries and calculate breakdown
+                        experience_entries = candidate_profile.get("experience_entries", [])
+                        if not isinstance(experience_entries, list):
+                            experience_entries = []
+                        
+                        # Process and classify each entry
+                        processed_entries = []
+                        for entry in experience_entries:
+                            if not isinstance(entry, dict):
+                                continue
+                            
+                            # Ensure type classification
+                            entry_text = f"{entry.get('role', '')} {entry.get('company', '')} {entry.get('date_range', '')}"
+                            entry_type = classify_experience_type(entry_text)
+                            
+                            # Parse date range
+                            date_range = entry.get("date_range", "")
+                            start_date, end_date = parse_date_range(date_range) if date_range else (None, None)
+                            
+                            processed_entry = {
+                                "role": entry.get("role", ""),
+                                "company": entry.get("company", ""),
+                                "date_range": date_range,
+                                "type": entry_type,
+                                "start_date": start_date,
+                                "end_date": end_date
+                            }
+                            processed_entries.append(processed_entry)
+                        
+                        # Calculate experience breakdown
+                        experience_breakdown = calculate_experience_breakdown(processed_entries)
+                        candidate_profile["experience_breakdown"] = experience_breakdown
+                        
+                        # Calculate total_years_experience from breakdown for internal scoring (but won't be in response)
+                        total_duration_str = experience_breakdown.get("total", "0 months")
+                        candidate_profile["total_years_experience"] = parse_duration_string(total_duration_str)
+                        
+                        logger.info(f"Calculated experience breakdown: {experience_breakdown}")
+                        logger.info(f"Total years (for internal scoring): {candidate_profile['total_years_experience']}")
+                        if "education" not in candidate_profile or not isinstance(candidate_profile.get("education"), list):
+                            candidate_profile["education"] = []
+                        if "certifications" not in candidate_profile or not isinstance(candidate_profile.get("certifications"), list):
+                            candidate_profile["certifications"] = []
+                        if "interests" not in candidate_profile or not isinstance(candidate_profile.get("interests"), list):
+                            candidate_profile["interests"] = []
+                        if "name" not in candidate_profile or not isinstance(candidate_profile.get("name"), str):
+                            candidate_profile["name"] = candidate_profile.get("name", "Unknown Candidate") or "Unknown Candidate"
+                    
+                    logger.info(f"✅ Resume parsing completed successfully")
+                    
+                    # Save to cache after successful parsing
+                    RESUME_PARSING_CACHE[resume_hash] = candidate_profile.copy()
+                    logger.info(f"✅ Resume parsing result saved to cache (hash: {resume_hash[:16]}...)")
+                    
+                    # Ensure candidate_profile is a dict BEFORE sending event
+                    if not isinstance(candidate_profile, dict):
+                        logger.warning(f"candidate_profile is not a dict, type: {type(candidate_profile)}, converting...")
+                        if hasattr(candidate_profile, 'dict'):
+                            candidate_profile = candidate_profile.dict()
+                        elif hasattr(candidate_profile, '__dict__'):
+                            candidate_profile = candidate_profile.__dict__
+                        else:
+                            candidate_profile = {"name": "Unknown", "skills": [], "total_years_experience": 0}
+                            logger.error("Could not convert candidate_profile to dict, using defaults")
+                    
+                    # SEND resume_parsed event IMMEDIATELY (before file operations)
+                    logger.info(f"Yielding resume_parsed event IMMEDIATELY with full candidate profile: name={candidate_profile.get('name')}")
+                    # Remove total_years_experience and other float year fields from response
+                    candidate_profile_response = {
+                        "name": candidate_profile.get("name"),
+                        "email": candidate_profile.get("email"),
+                        "phone": candidate_profile.get("phone"),
+                        "skills": candidate_profile.get("skills", []) if isinstance(candidate_profile.get("skills"), list) else [],
+                        "experience_summary": candidate_profile.get("experience_summary"),
+                        "experience_breakdown": candidate_profile.get("experience_breakdown", {
                             "full_time": "0 months",
                             "internship": "0 months",
                             "freelance": "0 months",
@@ -1674,147 +1849,54 @@ Return ONLY valid JSON, no markdown formatting."""
                             "contract": "0 months",
                             "academic": "0 months",
                             "total": "0 months"
-                        },
-                        "total_years_experience": 0.0,  # For internal scoring only
-                        "education": [],
-                        "certifications": [],
-                        "interests": []
+                        }),
+                        "education": candidate_profile.get("education", []),
+                        "certifications": candidate_profile.get("certifications", []),
+                        "interests": candidate_profile.get("interests", []),
+                        "raw_text_excerpt": candidate_profile.get("raw_text_excerpt")
                     }
-                else:
-                    # Validate and ensure all required fields exist with correct types
-                    if "skills" not in candidate_profile or not isinstance(candidate_profile.get("skills"), list):
-                        logger.warning("Skills field missing or invalid, initializing empty list")
-                        candidate_profile["skills"] = []
-                    if "experience_summary" not in candidate_profile or not isinstance(candidate_profile.get("experience_summary"), str):
-                        logger.warning("experience_summary missing or invalid, using resume text excerpt")
-                        candidate_profile["experience_summary"] = resume_text[:500] if resume_text else ""
+                    yield format_sse_event("resume_parsed", {
+                        "candidate_profile": candidate_profile_response
+                    })
+                    await asyncio.sleep(0)  # Force flush - CRITICAL for SSE
+                    logger.info("✅ resume_parsed event sent and flushed - continuing to file writes")
                     
-                    # Process experience entries and calculate breakdown
-                    experience_entries = candidate_profile.get("experience_entries", [])
-                    if not isinstance(experience_entries, list):
-                        experience_entries = []
+                    # NOW do file writes in background (non-blocking)
+                    async def write_resume_parsing_to_file():
+                        """Write resume parsing results to file asynchronously"""
+                        try:
+                            if response_file:
+                                logger.info("Writing LLM response and parsing result to file...")
+                                response_file.write(f"=== RAW LLM RESPONSE (Resume Parsing) ===\n")
+                                response_file.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                                response_file.write(f"Length: {len(full_response)} characters\n")
+                                response_file.write(f"{'='*60}\n\n")
+                                response_file.write(full_response)
+                                response_file.write(f"\n\n")
+                                response_file.write(f"=== RESUME PARSING RESULT ===\n")
+                                response_file.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                                response_file.write(f"{'='*60}\n\n")
+                                response_file.write(json.dumps(candidate_profile, indent=2, ensure_ascii=False))
+                                response_file.write(f"\n\n")
+                                response_file.flush()
+                                os.fsync(response_file.fileno())
+                                logger.info("✅ Resume parsing results written to file")
+                        except Exception as file_error:
+                            logger.error(f"Error writing resume parsing to file: {file_error}", exc_info=True)
                     
-                    # Process and classify each entry
-                    processed_entries = []
-                    for entry in experience_entries:
-                        if not isinstance(entry, dict):
-                            continue
-                        
-                        # Ensure type classification
-                        entry_text = f"{entry.get('role', '')} {entry.get('company', '')} {entry.get('date_range', '')}"
-                        entry_type = classify_experience_type(entry_text)
-                        
-                        # Parse date range
-                        date_range = entry.get("date_range", "")
-                        start_date, end_date = parse_date_range(date_range) if date_range else (None, None)
-                        
-                        processed_entry = {
-                            "role": entry.get("role", ""),
-                            "company": entry.get("company", ""),
-                            "date_range": date_range,
-                            "type": entry_type,
-                            "start_date": start_date,
-                            "end_date": end_date
-                        }
-                        processed_entries.append(processed_entry)
+                    # Start file write in background (don't await - non-blocking)
+                    asyncio.create_task(write_resume_parsing_to_file())
+                    logger.info("✅ File write task started in background")
                     
-                    # Calculate experience breakdown
-                    experience_breakdown = calculate_experience_breakdown(processed_entries)
-                    candidate_profile["experience_breakdown"] = experience_breakdown
-                    
-                    # Calculate total_years_experience from breakdown for internal scoring (but won't be in response)
-                    total_duration_str = experience_breakdown.get("total", "0 months")
-                    candidate_profile["total_years_experience"] = parse_duration_string(total_duration_str)
-                    
-                    logger.info(f"Calculated experience breakdown: {experience_breakdown}")
-                    logger.info(f"Total years (for internal scoring): {candidate_profile['total_years_experience']}")
-                    if "education" not in candidate_profile or not isinstance(candidate_profile.get("education"), list):
-                        candidate_profile["education"] = []
-                    if "certifications" not in candidate_profile or not isinstance(candidate_profile.get("certifications"), list):
-                        candidate_profile["certifications"] = []
-                    if "interests" not in candidate_profile or not isinstance(candidate_profile.get("interests"), list):
-                        candidate_profile["interests"] = []
-                    if "name" not in candidate_profile or not isinstance(candidate_profile.get("name"), str):
-                        candidate_profile["name"] = candidate_profile.get("name", "Unknown Candidate") or "Unknown Candidate"
-                
-                logger.info(f"✅ Resume parsing completed successfully")
-                
-                # Ensure candidate_profile is a dict BEFORE sending event
-                if not isinstance(candidate_profile, dict):
-                    logger.warning(f"candidate_profile is not a dict, type: {type(candidate_profile)}, converting...")
-                    if hasattr(candidate_profile, 'dict'):
-                        candidate_profile = candidate_profile.dict()
-                    elif hasattr(candidate_profile, '__dict__'):
-                        candidate_profile = candidate_profile.__dict__
-                    else:
-                        candidate_profile = {"name": "Unknown", "skills": [], "total_years_experience": 0}
-                        logger.error("Could not convert candidate_profile to dict, using defaults")
-                
-                # SEND resume_parsed event IMMEDIATELY (before file operations)
-                logger.info(f"Yielding resume_parsed event IMMEDIATELY with full candidate profile: name={candidate_profile.get('name')}")
-                # Remove total_years_experience and other float year fields from response
-                candidate_profile_response = {
-                    "name": candidate_profile.get("name"),
-                    "email": candidate_profile.get("email"),
-                    "phone": candidate_profile.get("phone"),
-                    "skills": candidate_profile.get("skills", []) if isinstance(candidate_profile.get("skills"), list) else [],
-                    "experience_summary": candidate_profile.get("experience_summary"),
-                    "experience_breakdown": candidate_profile.get("experience_breakdown", {
-                        "full_time": "0 months",
-                        "internship": "0 months",
-                        "freelance": "0 months",
-                        "part_time": "0 months",
-                        "contract": "0 months",
-                        "academic": "0 months",
-                        "total": "0 months"
-                    }),
-                    "education": candidate_profile.get("education", []),
-                    "certifications": candidate_profile.get("certifications", []),
-                    "interests": candidate_profile.get("interests", []),
-                    "raw_text_excerpt": candidate_profile.get("raw_text_excerpt")
-                }
-                yield format_sse_event("resume_parsed", {
-                    "candidate_profile": candidate_profile_response
-                })
-                await asyncio.sleep(0)  # Force flush - CRITICAL for SSE
-                logger.info("✅ resume_parsed event sent and flushed - continuing to file writes")
-                
-                # NOW do file writes in background (non-blocking)
-                async def write_resume_parsing_to_file():
-                    """Write resume parsing results to file asynchronously"""
-                    try:
-                        if response_file:
-                            logger.info("Writing LLM response and parsing result to file...")
-                            response_file.write(f"=== RAW LLM RESPONSE (Resume Parsing) ===\n")
-                            response_file.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                            response_file.write(f"Length: {len(full_response)} characters\n")
-                            response_file.write(f"{'='*60}\n\n")
-                            response_file.write(full_response)
-                            response_file.write(f"\n\n")
-                            response_file.write(f"=== RESUME PARSING RESULT ===\n")
-                            response_file.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                            response_file.write(f"{'='*60}\n\n")
-                            response_file.write(json.dumps(candidate_profile, indent=2, ensure_ascii=False))
-                            response_file.write(f"\n\n")
-                            response_file.flush()
-                            os.fsync(response_file.fileno())
-                            logger.info("✅ Resume parsing results written to file")
-                    except Exception as file_error:
-                        logger.error(f"Error writing resume parsing to file: {file_error}", exc_info=True)
-                
-                # Start file write in background (don't await - non-blocking)
-                asyncio.create_task(write_resume_parsing_to_file())
-                logger.info("✅ File write task started in background")
-                
-            except Exception as parse_error:
-                logger.error(f"Error in resume parsing: {parse_error}", exc_info=True)
-                import traceback
-                logger.error(f"Full traceback: {traceback.format_exc()}")
-                yield format_sse_event("error", {
-                    "message": f"Resume parsing failed: {str(parse_error)}"
-                })
-                await asyncio.sleep(0)  # Force flush
-                return
+                except Exception as parse_error:
+                    logger.error(f"Error in resume parsing: {parse_error}", exc_info=True)
+                    import traceback
+                    logger.error(f"Full traceback: {traceback.format_exc()}")
+                    yield format_sse_event("error", {
+                        "message": f"Resume parsing failed: {str(parse_error)}"
+                    })
+                    await asyncio.sleep(0)  # Force flush
+                    return
             
             # Extract jobs (simplified - handle new_format_jobs case)
             logger.info(f"Starting job extraction. new_format_jobs={new_format_jobs is not None}, type={type(new_format_jobs)}")
@@ -2025,12 +2107,68 @@ Return ONLY valid JSON, no markdown formatting."""
             for idx, job in enumerate(jobs, 1):
                 logger.info(f"Scoring job {idx}: {job.job_title} at {job.company}")
                 
+                # Timing: Start job scoring
+                job_scoring_start = time.perf_counter()
+                
+                # Detect role type: intern, senior, or regular full-time
+                job_title_lower = (job.job_title or "").lower()
+                job_desc_lower = (job.description or "").lower()[:1000]  # Check first 1000 chars for speed
+                
+                is_intern_role = (
+                    "intern" in job_title_lower or 
+                    "internship" in job_title_lower or
+                    "intern" in job_desc_lower or
+                    "internship" in job_desc_lower or
+                    "intern duration" in job_desc_lower or
+                    "3-6 months" in job_desc_lower or
+                    "summer intern" in job_title_lower
+                )
+                
+                is_senior_role = (
+                    "senior" in job_title_lower or
+                    "lead" in job_title_lower or
+                    "principal" in job_title_lower or
+                    "staff" in job_title_lower or
+                    "architect" in job_title_lower or
+                    "director" in job_title_lower or
+                    "manager" in job_title_lower or
+                    "senior" in job_desc_lower[:500] or  # Check first 500 chars
+                    "lead" in job_desc_lower[:500] or
+                    "principal" in job_desc_lower[:500]
+                )
+                
+                role_type = "intern" if is_intern_role else ("senior" if is_senior_role else "regular")
+                
+                if is_intern_role:
+                    logger.info(f"✅ Detected INTERNSHIP role for job {idx}: {job.job_title} - applying flexible evaluation rules")
+                elif is_senior_role:
+                    logger.info(f"✅ Detected SENIOR role for job {idx}: {job.job_title} - applying strict experience requirements")
+                else:
+                    logger.info(f"✅ Detected REGULAR full-time role for job {idx}: {job.job_title} - applying flexible evaluation rules")
+                
                 # Create scoring prompt with better handling of sparse descriptions
                 job_description_text = (job.description or "")[:3000]  # Increased to 3000 chars
                 description_length = len(job_description_text)
                 
+                # Add role type context to prompt
+                role_type_context = ""
+                if is_intern_role:
+                    role_type_context = """
+🚨 CRITICAL: THIS IS AN INTERNSHIP ROLE - APPLY FLEXIBLE EVALUATION RULES BELOW 🚨
+"""
+                elif is_senior_role:
+                    role_type_context = """
+🚨 CRITICAL: THIS IS A SENIOR ROLE - APPLY STRICT EXPERIENCE REQUIREMENTS BELOW 🚨
+"""
+                else:
+                    role_type_context = """
+🚨 CRITICAL: THIS IS A REGULAR FULL-TIME ROLE - APPLY FLEXIBLE EVALUATION RULES BELOW 🚨
+"""
+                
                 prompt = f"""
 You are a strict requirement-based job-candidate evaluator. Your task is to factually assess whether a candidate meets the EXACT requirements stated in the job description. NO assumptions, NO skill inflation, NO invented matches.
+
+{role_type_context}
 
 Candidate Profile:
 {json.dumps(candidate_profile, indent=2)}
@@ -2044,42 +2182,107 @@ Job Details:
 
 🚨 MANDATORY EVALUATION RULES (DO NOT VIOLATE):
 
-1. **EXTRACT ALL REQUIREMENTS - STRICT EXTRACTION (NO INVENTION):**
-   - Extract ONLY requirements explicitly stated in the job description
-   - Read the ENTIRE description and list EVERY requirement as a separate bullet point
-   - Extract from ALL sections: "Requirements", "Qualifications", "Skills", "Must Have", "Nice to Have", "Responsibilities", "Education", "Experience", etc.
-   - Categorize requirements into:
-     * Education Requirements (degree level, field of study) - ONLY if explicitly mentioned
-     * Experience Requirements (years, type of experience) - ONLY if explicitly mentioned
-     * Role Responsibilities (specific duties mentioned) - ONLY if explicitly mentioned
-     * Technical Skills REQUIRED (specific technologies, tools, languages marked as required/must have) - ONLY if explicitly mentioned
-     * Technical Skills PREFERRED (specific technologies, tools, languages marked as preferred/nice to have) - ONLY if explicitly mentioned
-     * Soft Skills (communication, leadership, etc.) - ONLY if explicitly mentioned
-     * Domain Knowledge (industry-specific experience) - ONLY if explicitly mentioned
+1. **EXTRACT ALL REQUIREMENTS - COMPREHENSIVE EXTRACTION (NO LIMIT, NO DUPLICATES):**
+   - 🚨 CRITICAL: Extract EVERY SINGLE requirement mentioned in the job description - there is NO limit on the number of requirements
+   - 🚨 CRITICAL: Do NOT stop at 8, 10, or any fixed number - extract ALL requirements comprehensively
+   - Extract requirements from BOTH job title AND job description
+   - 🚨 CRITICAL: If job title contains domain keywords (e.g., "AI / Machine Learning", "Data Science", "Full Stack", "Backend", "Frontend"), these indicate REQUIRED skills
+   - Example: Job title "Software Dev Intern - AI / Machine Learning" → REQUIRES: AI/ML domain knowledge, Python (standard for AI/ML)
+   - Example: Job title "Full Stack Developer" → REQUIRES: Frontend skills (React, HTML, CSS) AND Backend skills (Node.js, databases)
+   - Read the ENTIRE description word-by-word and list EVERY requirement as a separate entry
+   - ⚠️ CRITICAL: Extract EACH individual technical skill, EACH responsibility, EACH qualification separately - do NOT group them
+   - ⚠️ CRITICAL: If job lists "Python, Java, C++" → extract as THREE separate requirements: "Python (REQUIRED)", "Java (REQUIRED)", "C++ (REQUIRED)"
+   - ⚠️ CRITICAL: If job lists "Experience with AWS, Docker, Kubernetes" → extract as THREE separate requirements: "AWS (PREFERRED)", "Docker (PREFERRED)", "Kubernetes (PREFERRED)"
+   - ⚠️ CRITICAL: Each requirement category header (Education, Experience, Skills) should appear ONLY ONCE, but list ALL individual requirements under each category
+   - Extract from ALL sections: "Basic Qualifications", "Required Qualifications", "Preferred Qualifications", "Requirements", "Qualifications", "Skills", "Must Have", "Nice to Have", "Responsibilities", "Education", "Experience", "Key Responsibilities", "What You Will Bring", etc.
+   - ⚠️ CRITICAL: Extract BOTH "Basic Qualifications" (required) AND "Preferred Qualifications" (preferred) - do NOT skip preferred qualifications
+   - ⚠️ CRITICAL: Extract ALL individual items from lists, bullet points, and comma-separated values
+   - Categorize requirements into (each category header once, but list ALL individual requirements):
+     * Education Requirements (degree level, field of study) - Extract from description OR infer from role type (intern roles typically require Bachelor's in progress)
+     * Experience Requirements (years, type of experience) - Extract from description OR infer from role type (intern roles typically accept internships/projects) - LIST ONLY ONCE as category header
+     * Role Responsibilities (specific duties mentioned) - Extract EACH responsibility separately from description
+     * Technical Skills REQUIRED (specific technologies, tools, languages) - Extract EACH skill separately from description OR job title keywords
+       ⚠️ CRITICAL: List EACH SPECIFIC technology name as a separate requirement (e.g., "TensorFlow (REQUIRED)", "PyTorch (REQUIRED)", "Scikit-learn (REQUIRED)", "Pandas (REQUIRED)", "NumPy (REQUIRED)", "Keras (REQUIRED)", "OpenCV (REQUIRED)") - NOT generic terms like "AI/ML tools"
+       ⚠️ CRITICAL: If job title says "AI / Machine Learning", extract specific AI/ML technologies mentioned in description, or list common ones if description is sparse
+     * Technical Skills PREFERRED (specific technologies, tools, languages marked as preferred/nice to have) - Extract EACH skill separately from description
+       ⚠️ CRITICAL: List EACH SPECIFIC technology name as a separate requirement (e.g., "AWS (PREFERRED)", "Docker (PREFERRED)", "Kubernetes (PREFERRED)", "TypeScript (PREFERRED)") - NOT generic terms like "cloud tools" or "specific technologies"
+     * Soft Skills (communication, leadership, etc.) - Extract EACH soft skill separately from description
+     * Domain Knowledge (industry-specific experience like AI/ML, Data Science, etc.) - Extract from description OR job title - LIST ONLY ONCE as category header
    - ⚠️ CRITICAL: Mark skills as REQUIRED or PREFERRED based on job description wording
+   - ⚠️ CRITICAL: Job title keywords (AI/ML, Data Science, Full Stack, etc.) indicate REQUIRED skills
    - ⚠️ DO NOT extract: Certifications (unless explicitly mentioned), Location requirements, visa/work authorization, security clearance UNLESS explicitly mentioned in description
-   - ⚠️ DO NOT infer requirements - only extract what is explicitly stated
-   - ⚠️ DO NOT add "typical" requirements for this role type
-   - ⚠️ DO NOT invent requirements based on job title or company name
-   - ⚠️ If a requirement category is NOT mentioned in job description, DO NOT include it in your output
+   - ⚠️ DO NOT invent requirements beyond what is in job title/description
+   - ⚠️ If job description is sparse, extract requirements from job title keywords
+   - ⚠️ If a requirement category is NOT mentioned in job title OR description, DO NOT include it in your output (but DO extract from title if description is missing)
+   - 🚨 CRITICAL: The total number of requirements can be 5, 10, 15, 20, or more - extract ALL of them without any artificial limit
 
-2. **STRICT REQUIREMENT EVALUATION - NO ASSUMPTIONS:**
-   - For EACH requirement, check candidate profile for EXPLICIT evidence
-   - DO NOT assume or infer experience
+2. **STRICT REQUIREMENT EVALUATION - CHECK ALL CANDIDATE DATA:**
+   - For EACH requirement, check candidate profile for EXPLICIT evidence in:
+     * skills array (explicitly listed skills)
+     * experience_summary (mentions of projects, technologies, domains)
+     * experience_entries (roles, companies, responsibilities)
+     * education (degree, field of study)
+   - 🚨 CRITICAL: If job requires "AI/ML" or "Machine Learning" and candidate's experience_summary mentions "AI", "ML", "machine learning", "artificial intelligence", or "AI and ML" → MET
+   - 🚨 CRITICAL: If job title contains "AI / Machine Learning" and candidate's experience_summary mentions AI/ML projects → MET (job title indicates required domain)
+   - 🚨 CRITICAL: If job requires domain knowledge and candidate's experience_summary mentions relevant projects/experience → MET
+   - Example: Job title "AI / Machine Learning Intern", candidate's experience_summary says "Greenwash Monitoring Using AI and ML" → Domain Knowledge = MET (project demonstrates AI/ML experience)
+   - Example: Job requires "AI/ML skills", candidate's experience_summary says "Greenwash Monitoring Using AI and ML" → MET (project demonstrates AI/ML experience)
+   - Example: Job requires "Full Stack", candidate's experience_summary mentions "MERN stack application" → MET (demonstrates full-stack experience)
+   - ⚠️ DO NOT mark domain knowledge as NOT MET if candidate's experience_summary mentions relevant projects - check experience_summary carefully
+   - DO NOT assume or infer experience beyond what is explicitly stated
    - DO NOT count unrelated skills as matches
    - DO NOT inflate matches - be factual and strict
 
-3. **EXPERIENCE REQUIREMENTS - CRITICAL RULES:**
-   - If job requires "X years of experience", ONLY count full-time work experience
-   - Internships DO NOT count toward years of experience requirements
-   - Academic projects DO NOT count toward years of experience requirements
-   - Part-time work counts proportionally (e.g., 2 years part-time = 1 year full-time)
-   - If candidate is a student with only internships/academic projects and job requires experience → NOT MET
-   - Example: Job requires "3+ years experience", candidate has 2 internships (6 months each) → NOT MET (internships don't count)
-   - Example: Job requires "5 years experience", candidate has 1 year full-time + 2 years part-time → Calculate: 1 + (2/2) = 2 years → NOT MET
+3. **EXPERIENCE REQUIREMENTS - CRITICAL RULES (ROLE-TYPE DEPENDENT):**
+   
+   🚨 **IF THIS IS A SENIOR ROLE** (job title/description contains "senior", "lead", "principal", "staff", "architect", "director", "manager"):
+   - ⚠️ STRICT: ONLY full-time work experience counts toward years of experience requirements
+   - ⚠️ Internships DO NOT count toward years of experience requirements for senior roles
+   - ⚠️ Academic projects DO NOT count toward years of experience requirements for senior roles
+   - ⚠️ Part-time work counts proportionally (e.g., 2 years part-time = 1 year full-time)
+   - ⚠️ Extract the exact years required from job description (e.g., "5+ years", "3-5 years", "minimum 7 years")
+   - ⚠️ If candidate is a student with only internships/academic projects and job requires experience → NOT MET
+   - Example: Job requires "5+ years experience", candidate has 2 internships (6 months each) → NOT MET (internships don't count for senior roles)
+   - Example: Job requires "3-5 years experience", candidate has 1 year full-time + 2 years part-time → Calculate: 1 + (2/2) = 2 years → NOT MET
+   
+   **IF THIS IS AN INTERNSHIP OR REGULAR FULL-TIME ROLE** (NOT senior):
+   - ✅ FLEXIBLE: Skills, projects, internships, and academic work ALL count as relevant experience
+   - ✅ If candidate has skills listed in job requirements → MET (skills are valid evidence)
+   - ✅ If candidate's experience_summary mentions projects demonstrating required skills → MET (projects are valid evidence)
+   - ✅ If candidate's experience_summary mentions technologies/domains matching job requirements → MET
+   - ✅ If candidate has internships related to job requirements → MET (internships are valid experience)
+   - ✅ If job requires "AI/ML" and candidate's experience_summary mentions "AI", "ML", "machine learning", or "artificial intelligence" → MET
+   - ✅ If job does NOT specify experience requirement → candidate's internships/projects = MET (for intern/regular roles, any relevant experience counts)
+   - ✅ Extract years from job description if mentioned, but be flexible in what counts toward those years
+   - ✅ If job requires "X years of experience", count: full-time work + internships + relevant projects
+   - ✅ If job says "Previous technical internship(s) or demonstrated project experience" → candidate's internships = MET (not PARTIALLY MET)
+   - ✅ If job description is sparse but job title indicates domain (e.g., "AI / Machine Learning"), candidate's relevant skills/projects/experience_summary mentions = MET
+   - ✅ If job does NOT specify experience requirement for intern role → candidate's internships = MET (internships are expected for intern roles)
+   - ⚠️ CRITICAL: If job requires "Data structures / Algorithms / OOP" or "Demonstrated experience with data structures / algorithms / OOP" and candidate only has programming languages (Python, Java, C++) but NO explicit mention of data structures, algorithms, or OOP in experience_summary or skills → PARTIALLY MET (not MET - do not infer from programming languages alone)
+   - ⚠️ CRITICAL: If job requires "Data structures / Algorithms / OOP" and candidate's experience_summary explicitly mentions "data structures", "algorithms", "object-oriented", "OOP", or similar → MET (explicit evidence exists)
+   - Example: Job title "AI / Machine Learning Intern", candidate has Python + experience_summary mentions "AI and ML projects" → MET (Python is standard for AI/ML, projects demonstrate experience)
+   - Example: Job requires "Data structures / Algorithms / OOP", candidate has Python/Java but no explicit mention → PARTIALLY MET (implied but not explicit)
+   - Example: Job requires "2+ years experience", candidate has 1 internship + academic projects → MET (flexible counting)
+   - Example: Job requires "Python, Java, React", candidate has these in skills/projects → MET (skills/projects count)
+   - Example: Job requires "AI/ML skills", candidate's experience_summary says "Greenwash Monitoring Using AI and ML" → MET (project demonstrates AI/ML experience)
+   - Example: Job is "Intern" role with no experience requirement specified, candidate has 2 months internships → MET (internships count for intern roles)
 
-4. **EDUCATION REQUIREMENTS (CRITICAL - NO BINARY LOGIC):**
-   - Match exact degree level required (Bachelor's, Master's, PhD)
+4. **EDUCATION REQUIREMENTS (CRITICAL - ROLE-TYPE DEPENDENT):**
+   
+   🚨 **IF THIS IS AN INTERNSHIP ROLE**:
+   - ✅ If job requires "Currently enrolled in Bachelor's degree" or "enrolled in Bachelor's" → candidate pursuing Bachelor's = MET (NOT PARTIALLY MET)
+   - ✅ If job requires "Bachelor's degree OR completed" → candidate pursuing Bachelor's = MET
+   - ✅ If job requires "Bachelor's degree" (without "completed") → candidate pursuing Bachelor's = MET (intern roles typically accept in-progress)
+   - ✅ If job description is sparse but role is "Intern" → assume Bachelor's in progress is acceptable → candidate pursuing Bachelor's = MET
+   - ✅ If job explicitly requires "completed Bachelor's degree" → candidate pursuing Bachelor's = PARTIALLY MET (only if explicitly says "completed")
+   - ✅ If job does NOT specify education requirement → candidate pursuing Bachelor's = MET (intern roles typically accept in-progress)
+   - Field of study must match if specified (e.g., "Computer Science" ≠ "Electrical Engineering" unless job accepts both)
+   - ⚠️ CRITICAL: For intern roles, "currently enrolled" or "pursuing" = MET, NOT PARTIALLY MET
+   - ⚠️ CRITICAL: For intern roles, if education requirement is not specified or unclear, assume Bachelor's in progress is acceptable = MET
+   - ⚠️ DO NOT mark education as PARTIALLY MET for intern roles unless job explicitly requires "completed" degree
+   
+   **IF THIS IS A REGULAR FULL-TIME OR SENIOR ROLE**:
+   - Match exact degree level required (Bachelor's, Master's, PhD) - extract from job description
    - ⚠️ CRITICAL RULE: If job requires "Bachelor's degree" and candidate is "pursuing Bachelor's" or "expected graduation 2027" → PARTIALLY MET (NOT NOT MET)
    - ⚠️ CRITICAL RULE: If job requires "completed Bachelor's degree" and candidate is "pursuing Bachelor's" → PARTIALLY MET
    - If job requires "Master's degree" and candidate has only "Bachelor's" → NOT MET
@@ -2088,18 +2291,28 @@ Job Details:
    - ⚠️ DO NOT downgrade PARTIALLY_MET to NOT_MET for education - degree in progress IS partial match
 
 5. **TECHNICAL SKILLS - REQUIRED vs PREFERRED (CRITICAL DISTINCTION):**
-   - ⚠️ CRITICAL: Differentiate between REQUIRED and PREFERRED skills
-   - REQUIRED skills: Must be explicitly in candidate profile → MET or NOT MET
-   - PREFERRED skills: If candidate has it → PARTIALLY MET, if not → NOT MET
-   - Only count skills EXPLICITLY listed in candidate profile
+   - ⚠️ CRITICAL: Differentiate between REQUIRED (Basic Qualifications) and PREFERRED (Preferred Qualifications) skills
+   - ⚠️ CRITICAL: Extract BOTH Basic Qualifications (required) AND Preferred Qualifications (preferred) from job description
+   - ⚠️ CRITICAL: When listing technical skills, ALWAYS include the SPECIFIC technology name (e.g., "TensorFlow", "PyTorch", "AWS", "Docker", "LLM", "VLM", "GenAI") - NOT generic terms
+   - ⚠️ CRITICAL: Format as "[Specific Technology Name] (MET/NOT MET - [evidence])" - e.g., "TensorFlow (NOT MET - candidate does not list TensorFlow)"
+   - REQUIRED skills (Basic Qualifications): Must be explicitly in candidate profile → MET or NOT MET
+   - PREFERRED skills (Preferred Qualifications): If candidate has it → PARTIALLY MET, if not → NOT MET
+   - Only count skills EXPLICITLY listed in candidate profile OR mentioned in experience_summary
+   - Check candidate's skills array AND experience_summary for technology mentions
    - DO NOT count AI/ML/Python skills unless job explicitly requires them
-   - DO NOT assume related skills (e.g., "Python" does NOT automatically mean "Data Science")
+   - DO NOT assume related skills (e.g., "Python" does NOT automatically mean "Data Science" or "TensorFlow")
    - Skill variations are acceptable (React.js = React, .NET = .Net, SQL = MySQL = PostgreSQL, etc.)
    - If job requires "TypeScript" and candidate has "JavaScript" but NOT "TypeScript" → NOT MET (they are different)
    - If job requires "Python" and candidate has "Python" → MET
+   - If job requires "TensorFlow" and candidate has "Python" but NOT "TensorFlow" → NOT MET (Python ≠ TensorFlow)
+   - If job PREFERS "GenAI/LLM/VLM" and candidate has "Machine Learning" but NOT "LLM" or "GenAI" → NOT MET (ML ≠ GenAI/LLM)
+   - If job PREFERS "AWS" and candidate does NOT have "AWS" → NOT MET
+   - If job PREFERS "Database systems (SQL and NoSQL)" and candidate has "MySQL" (SQL) but NOT "MongoDB" or "NoSQL" → PARTIALLY MET (has SQL, missing NoSQL)
    - If job PREFERS "SQL" and candidate has "SQL" or "MySQL" or "PostgreSQL" → PARTIALLY MET (preferred skill matched)
    - If job PREFERS "SQL" and candidate does NOT have it → NOT MET
    - ⚠️ DO NOT treat preferred skills as required - they should be PARTIALLY_MET when matched
+   - ⚠️ DO NOT use generic terms like "AI/ML tools", "specific technologies", "cloud tools" - always name the specific technology
+   - ⚠️ CRITICAL: Extract ALL preferred qualifications from "Preferred Qualifications" section - do NOT skip them
 
 6. **ROLE RESPONSIBILITIES:**
    - Check if candidate's experience_summary or experience_entries show evidence of similar responsibilities
@@ -2115,51 +2328,96 @@ Job Details:
    - PARTIALLY MET: Candidate has some evidence but not fully (e.g., pursuing degree vs. completed degree)
    - NOT MET: No evidence or insufficient evidence in candidate profile
 
-9. **MATCH PERCENTAGE CALCULATION (STRICT):**
-   - Match Percentage = (Requirements MET / Total Requirements) × 100
-   - ⚠️ CRITICAL: PARTIALLY MET does NOT count toward match percentage
-   - Only fully MET requirements contribute to the score
-   - Example: 8 total requirements, 3 MET, 2 PARTIALLY MET, 3 NOT MET
-   - Calculation: 3 / 8 = 37.5% match (NOT 50% - partial matches don't count)
-   - Round to 2 decimal places
+9. **MATCH SCORE CALCULATION (STRICT - DECIMAL FORMAT):**
+   - Match Score = (REQUIRED Requirements MET / Total REQUIRED Requirements) as a decimal between 0.00 and 1.00
+   - ⚠️ CRITICAL: PARTIALLY MET does NOT count toward match score numerator
+   - ⚠️ CRITICAL: Only REQUIRED (Basic Qualifications) count toward match score - PREFERRED qualifications do NOT count toward score
+   - ⚠️ CRITICAL: Total Requirements = REQUIRED requirements only (exclude preferred from total count)
+   - Only fully MET REQUIRED requirements contribute to the score
+   - 🚨 GOLDEN RULE: If ANY REQUIRED requirement is PARTIALLY MET, the maximum score is capped at 0.75 (75%)
+   - 🚨 GOLDEN RULE: Match score = 1.00 (100%) is ONLY allowed when ALL REQUIRED requirements are MET and NO REQUIRED requirement is PARTIALLY MET
+   - Example: 5 REQUIRED requirements (3 MET, 1 PARTIALLY MET, 1 NOT MET), 3 PREFERRED requirements
+   - Calculation: 3 / 5 = 0.60, but since 1 is PARTIALLY MET → capped at 0.75 maximum
+   - Example: 5 REQUIRED requirements (4 MET, 1 PARTIALLY MET), 3 PREFERRED requirements
+   - Calculation: 4 / 5 = 0.80, but since 1 is PARTIALLY MET → capped at 0.75 maximum
+   - Example: 5 REQUIRED requirements (5 MET, 0 PARTIALLY MET) → score = 5 / 5 = 1.00 (allowed)
+   - ⚠️ CRITICAL: Return match_score as a decimal (0.00 to 1.00), NOT as a percentage (0 to 100)
+   - Round to 2 decimal places (e.g., 0.625, 0.75, 0.375)
 
-10. **FINAL VERDICT (STRICT):**
-    - STRONG FIT: Match percentage ≥ 75% AND all critical requirements (experience, education) are MET
-    - PARTIAL FIT: Match percentage 40-74% (even if some requirements are PARTIALLY MET)
-    - NOT A FIT: Match percentage < 40% OR critical requirements are NOT MET
+10. **FINAL VERDICT (STRICT - ROLE-TYPE DEPENDENT):**
+   
+   🚨 **IF THIS IS AN INTERNSHIP ROLE**:
+    - STRONG FIT: Match score ≥ 0.70 AND core requirements (education, programming languages) are MET
+    - GOOD FIT (INTERN LEVEL): Match score 0.50-0.69 AND core requirements are MET or PARTIALLY MET
+    - PARTIAL FIT: Match score 0.40-0.49 OR some core requirements are PARTIALLY MET
+    - NOT A FIT: Match score < 0.40 OR critical core requirements are NOT MET
+    - ⚠️ For intern roles, match scores of 0.60-0.75 are EXPECTED and GOOD for internship positions
+   
+   **IF THIS IS A REGULAR FULL-TIME ROLE** (NOT senior):
+    - STRONG FIT: Match score ≥ 0.70 AND core requirements (skills, education) are MET
+    - GOOD FIT: Match score 0.50-0.69 AND core requirements are MET or PARTIALLY MET
+    - PARTIAL FIT: Match score 0.40-0.49 OR some core requirements are PARTIALLY MET
+    - NOT A FIT: Match score < 0.40 OR critical requirements are NOT MET
+    - ⚠️ Skills, projects, and internships count as evidence for regular roles
+   
+   **IF THIS IS A SENIOR ROLE**:
+    - STRONG FIT: Match score ≥ 0.75 AND all critical requirements (experience years, education) are MET
+    - PARTIAL FIT: Match score 0.40-0.74 (even if some requirements are PARTIALLY MET)
+    - NOT A FIT: Match score < 0.40 OR critical experience requirements are NOT MET
+    - ⚠️ For senior roles, full-time experience is REQUIRED - internships/projects don't count
 
 Return ONLY valid JSON (no markdown) with the following structure:
 {{
-  "match_score": 0.00,
-  "key_matches": ["Only skills/qualifications that are explicitly MET (not PARTIALLY MET)"],
+  "match_score": 0.00,  // Decimal between 0.00 and 1.00 (NOT percentage - divide by 100 if you calculated percentage)
+  "key_matches": ["Only skills/qualifications that are explicitly MET AND relevant to job requirements (not PARTIALLY MET, not unrelated skills)"],
   "requirements_met": 0,
-  "total_requirements": 8,
+  "total_requirements": 0,  // Count ONLY REQUIRED (Basic Qualifications), NOT Preferred Qualifications. This number should equal the total count of ALL individual required requirements extracted (can be 5, 10, 15, 20, or more - no limit)
   "requirements_satisfied": [
     "Requirement 1 (MET - candidate has [explicit evidence])",
-    "Requirement 2 (MET - candidate lists [specific skill] as a skill)"
+    "Python (MET - candidate lists Python as a skill)",
+    "TensorFlow (MET - candidate has TensorFlow experience)"
   ],
   "requirements_missing": [
     "Requirement 3 (NOT MET - not mentioned in candidate profile)",
-    "Requirement 4 (NOT MET - candidate lacks [specific item])",
-    "Requirement 5 (NOT MET - internships do not count for experience requirement)"
+    "PyTorch (NOT MET - candidate does not list PyTorch)",
+    "AWS (NOT MET - candidate lacks AWS experience)"
   ],
   "requirements_partially_met": [
     "Education (PARTIALLY MET - candidate is pursuing Bachelor's degree, job requires completed degree)",
     "SQL (PARTIALLY MET - candidate has SQL, job lists SQL as preferred skill)"
   ],
+  // NOTE: Preferred qualifications (GenAI, AWS, NoSQL, etc.) should be listed in requirements_missing if not met,
+  // but they do NOT count toward total_requirements for match score calculation
   "improvements_needed": [],
-  "reasoning": "Strict factual assessment: [X] requirements met out of [Y] total. [Z] requirements partially met (do not count toward score). [Critical missing requirements]. Match percentage: [X/Y × 100]%",
-  "summary": "One-sentence factual verdict: 'The candidate meets [X] out of [Y] requirements and partially meets [Z] requirements. [Critical gap if any].' Example: 'The candidate meets 0 out of 8 requirements and partially meets 2 requirements (education in progress, SQL preferred skill). Critical gaps: lacks required 3+ years experience (only has internships), missing required Rightsline platform skill.'"
+  "reasoning": "Strict factual assessment: [X] requirements met out of [Y] total. [Z] requirements partially met (do not count toward score). [Critical missing requirements]. Match score: [X/Y] (as decimal 0.00-1.00). Extract ALL requirements - no limit on number.",
+  "summary": "One-sentence factual verdict: 'The candidate meets [X] out of [Y] requirements and partially meets [Z] requirements. [Critical gap if any].' Example: 'The candidate meets 5 out of 12 requirements and partially meets 2 requirements (education in progress, SQL preferred skill). Critical gaps: lacks required 3+ years experience (only has internships), missing required Rightsline platform skill.' Note: Y can be any number - extract ALL requirements comprehensively."
 }}
 
 FINAL REMINDERS - STRICT EVALUATION CHECKLIST:
-- ✅ Extract ALL requirements from job description - be comprehensive
-- ✅ For EACH requirement, check candidate profile for EXPLICIT evidence
-- ✅ Internships and academic projects DO NOT count for experience years
-- ✅ Students with only internships = NOT MET for experience requirements
-- ✅ DO NOT count AI/ML/Python unless job explicitly requires them
+- ✅ Extract ALL requirements from BOTH job title AND job description - be comprehensive, NO LIMIT on number of requirements
+- ✅ Extract EACH individual skill, qualification, and responsibility separately - do NOT group them
+- ✅ If job lists "Python, Java, C++" → extract as THREE separate requirements, not one grouped requirement
+- ✅ The total_requirements count can be 5, 10, 15, 20, or more - extract ALL of them
+- 🚨 CRITICAL: If job title contains domain keywords (AI/ML, Data Science, Full Stack, etc.), extract these as REQUIRED domain knowledge
+- 🚨 CRITICAL: Job title "AI / Machine Learning" → REQUIRES: AI/ML domain knowledge, Python (standard for AI/ML)
+- 🚨 CRITICAL: Check candidate's experience_summary for domain knowledge - if job requires "AI/ML" and experience_summary mentions "AI and ML" or "machine learning" → MET
+- 🚨 CRITICAL: When listing technical skills, ALWAYS include SPECIFIC technology names (e.g., "TensorFlow", "PyTorch", "AWS", "Docker", "Kubernetes", "TypeScript") - NOT generic terms like "AI/ML tools" or "specific technologies"
+- 🚨 CRITICAL: Format technical skill requirements as "[Technology Name] (MET/NOT MET - [evidence])" - e.g., "TensorFlow (NOT MET - candidate does not list TensorFlow)" or "PyTorch (NOT MET - candidate lacks PyTorch experience)"
+- ✅ Extract years of experience from job description (e.g., "3+ years", "5-7 years") - DO NOT hardcode
+- ✅ For EACH requirement, check candidate profile for EXPLICIT evidence in skills, experience_summary, experience_entries, education
+- ⚠️ CRITICAL: Do NOT list the same requirement category twice (e.g., do NOT have "Experience Requirements" in both satisfied and missing)
+- ⚠️ CRITICAL: key_matches should ONLY include skills/qualifications that are MET AND relevant to job requirements (not all candidate skills)
+- 🚨 IF SENIOR ROLE: ONLY full-time experience counts - internships/projects DO NOT count
+- 🚨 IF INTERN/REGULAR ROLE: Skills, projects, internships ALL count as evidence - if candidate has required skills → MET
+- 🚨 IF INTERN ROLE: Education "in progress" or "currently enrolled" = MET (not PARTIALLY MET) unless job explicitly requires "completed"
+- 🚨 IF INTERN ROLE: If education not specified, assume Bachelor's in progress is acceptable = MET
+- 🚨 IF REGULAR/SENIOR ROLE: Education "in progress" = PARTIALLY MET (not MET)
+- ✅ DO NOT say "job does not specify" if requirements can be extracted from job title
+- ✅ If job description is sparse, extract requirements from job title keywords
+- ✅ If job title says "AI / Machine Learning" and candidate's experience_summary mentions AI/ML projects → Domain Knowledge = MET
+- ✅ DO NOT use generic terms in requirements - always specify the exact technology name (e.g., "TensorFlow" not "AI/ML tools", "AWS" not "cloud tools")
 - ✅ DO NOT inflate matches - be strict and factual
-- ✅ Match percentage = MET / Total × 100 (PARTIALLY_MET does NOT count)
+- ✅ Match score = MET / Total (as decimal 0.00-1.00, NOT percentage) (PARTIALLY_MET does NOT count)
 - ✅ Every requirement must be labeled: MET, PARTIALLY MET, or NOT MET
 - ✅ Provide explicit evidence for each label
 - ✅ ⚠️ CRITICAL: Degree in progress (pursuing Bachelor's/Master's) = PARTIALLY MET, NOT NOT MET
@@ -2167,7 +2425,9 @@ FINAL REMINDERS - STRICT EVALUATION CHECKLIST:
 - ✅ ⚠️ CRITICAL: DO NOT invent requirements - if certification/location/visa not in description, DO NOT include it
 - ✅ total_requirements MUST equal len(requirements_satisfied) + len(requirements_missing) + len(requirements_partially_met)
 - ✅ requirements_met = len(requirements_satisfied) ONLY (PARTIALLY_MET does NOT count toward requirements_met)
-- ✅ Match percentage = requirements_met / total_requirements × 100 (PARTIALLY_MET does NOT contribute to score)
+- ✅ Match score = requirements_met / total_requirements (as decimal 0.00-1.00, NOT percentage) (PARTIALLY_MET does NOT contribute to score)
+- ✅ total_requirements = REQUIRED requirements only (exclude Preferred Qualifications from count)
+- ✅ Extract and list Preferred Qualifications separately - they go in requirements_partially_met or requirements_missing, but do NOT count toward total_requirements
 - ✅ Final verdict: STRONG FIT (≥75%), PARTIAL FIT (40-74%), NOT A FIT (<40%)
 - ✅ Summary must be factual, not softened - state gaps clearly
 - ✅ DO NOT add suggestions, strengths, or unrelated skills
@@ -2339,9 +2599,28 @@ FINAL REMINDERS - STRICT EVALUATION CHECKLIST:
                     data_result["reasoning"] = "Score calculated based on candidate-job alignment"
                 
                 score = float(data_result.get("match_score", 0.5))
+                
+                # Normalize score to 0-1 range (in case LLM returns percentage 0-100)
+                if score > 1.0:
+                    logger.warning(f"Match score {score} is > 1.0, normalizing to decimal (dividing by 100)")
+                    score = score / 100.0
+                
+                # Ensure score is between 0 and 1
+                score = max(0.0, min(1.0, score))
+                
                 requirements_satisfied_list = data_result.get("requirements_satisfied", []) or []
                 requirements_missing_list = data_result.get("requirements_missing", []) or []
                 requirements_partially_met_list = data_result.get("requirements_partially_met", []) or []
+                
+                # GOLDEN RULE: Cap score at 0.75 if ANY REQUIRED requirement is PARTIALLY MET
+                # Score = 1.00 is ONLY allowed when ALL REQUIRED requirements are MET and NO REQUIRED requirement is PARTIALLY MET
+                # Count PARTIALLY MET requirements that are REQUIRED (not preferred)
+                # Preferred qualifications are already excluded from total_requirements, so any partially_met here are required
+                if len(requirements_partially_met_list) > 0:
+                    # There are partially met REQUIRED requirements - cap score at 0.75
+                    if score > 0.75:
+                        logger.info(f"Job {idx}: Capping score from {score} to 0.75 because {len(requirements_partially_met_list)} REQUIRED requirement(s) are PARTIALLY MET")
+                        score = 0.75
                 
                 # Post-processing: Filter out invented requirements (certifications, location, visa, clearance unless explicitly mentioned)
                 # This prevents LLM from adding requirements not in the job description
@@ -2581,8 +2860,20 @@ FINAL REMINDERS - STRICT EVALUATION CHECKLIST:
                     logger.warning(f"Requirements met ({requirements_met}) exceeds total requirements ({total_requirements}) for job {idx}. Capping to total.")
                     requirements_met = total_requirements
                 
+                # Recalculate score from actual requirements_met / total_requirements to ensure consistency
+                if total_requirements > 0:
+                    calculated_score = requirements_met / total_requirements
+                    # Use calculated score if it's more accurate (within 0.05 tolerance)
+                    if abs(calculated_score - score) > 0.05:
+                        logger.info(f"Job {idx}: Using calculated score {calculated_score} instead of LLM score {score} (difference > 0.05)")
+                        score = calculated_score
+                    # Apply cap again after recalculation
+                    if len(requirements_partially_met_list) > 0 and score > 0.75:
+                        logger.info(f"Job {idx}: Capping recalculated score from {score} to 0.75 because {len(requirements_partially_met_list)} REQUIRED requirement(s) are PARTIALLY MET")
+                        score = 0.75
+                
                 # Log final validation summary
-                logger.info(f"Job {idx} requirements validation: total={total_requirements}, satisfied={len(requirements_satisfied_list)}, partially_met={len(requirements_partially_met_list)}, missing={len(requirements_missing_list)}, met={requirements_met}")
+                logger.info(f"Job {idx} requirements validation: total={total_requirements}, satisfied={len(requirements_satisfied_list)}, partially_met={len(requirements_partially_met_list)}, missing={len(requirements_missing_list)}, met={requirements_met}, final_score={score}")
                 
                 # Extract reasoning separately (needed for logging)
                 reasoning = data_result.get("reasoning", "Score calculated based on candidate-job alignment")
@@ -2617,6 +2908,15 @@ FINAL REMINDERS - STRICT EVALUATION CHECKLIST:
                     "reasoning": data_result.get("reasoning", "Score calculated based on candidate-job alignment"),
                     "summary": summary_text,
                 })
+                
+                # Timing: End job scoring
+                job_scoring_duration = time.perf_counter() - job_scoring_start
+                yield format_sse_event("timing", {
+                    "step": "job_scoring",
+                    "job_index": idx,
+                    "seconds": round(job_scoring_duration, 3)
+                })
+                await asyncio.sleep(0)  # Force flush
                 
                 # Event 6: Job scored - send complete job data as job_scored event
                 logger.info(f"Yielding job_scored event for job {idx}: score={score}")
@@ -2730,6 +3030,10 @@ FINAL REMINDERS - STRICT EVALUATION CHECKLIST:
             
             if jobs and jobs[0].company:
                 logger.info(f"Checking sponsorship for company: {jobs[0].company}")
+                
+                # Timing: Start sponsorship check
+                sponsorship_check_start = time.perf_counter()
+                
                 cleaned_name = clean_company_name(jobs[0].company)
                 if cleaned_name:
                     try:
@@ -2745,6 +3049,14 @@ FINAL REMINDERS - STRICT EVALUATION CHECKLIST:
                                 "sponsorship_mentioned_in_job": sponsorship_result.get("sponsorship_mentioned_in_job"),
                                 "sc_clearance_required": sponsorship_result.get("sc_clearance_required")
                             }
+                            
+                            # Timing: End sponsorship check
+                            sponsorship_check_duration = time.perf_counter() - sponsorship_check_start
+                            yield format_sse_event("timing", {
+                                "step": "sponsorship_check",
+                                "seconds": round(sponsorship_check_duration, 3)
+                            })
+                            await asyncio.sleep(0)  # Force flush
                             
                             # Event 8: Sponsorship result - stream complete sponsorship data
                             logger.info(f"Yielding sponsorship_checked event for company: {sponsorship_info.get('company_name')}")

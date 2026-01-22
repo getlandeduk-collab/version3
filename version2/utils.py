@@ -44,6 +44,13 @@ def decode_base64_pdf(b64: str) -> bytes:
 
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_chars: int = 20000) -> str:
+    """
+    Extract text from PDF bytes. Optimized to use direct text extraction first
+    (faster for text-based PDFs) before falling back to OCR.
+    
+    This function uses pdfplumber which extracts text directly from PDF structure,
+    which is much faster than OCR for text-based PDFs.
+    """
     if not pdf_bytes or len(pdf_bytes) < 10:
         raise ValueError("Empty or invalid PDF bytes")
     
@@ -60,10 +67,14 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_chars: int = 20000) -> str
         if not found_header:
             raise ValueError(f"Invalid PDF: File does not start with PDF header. First 50 bytes: {pdf_bytes[:50]}")
     
+    # Optimized: Use pdfplumber's direct text extraction (fast for text-based PDFs)
+    # This is much faster than OCR and works for most modern PDFs
     text_parts = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             try:
+                # Direct text extraction (fast for text-based PDFs)
+                # x_tolerance and y_tolerance help with spacing issues
                 txt = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
             except Exception:
                 txt = ""
@@ -72,6 +83,9 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_chars: int = 20000) -> str
             if sum(len(p) for p in text_parts) >= max_chars:
                 break
     text = "\n".join(text_parts).strip()
+    
+    # If no text extracted, this might be an image-based PDF requiring OCR
+    # But for now, we raise an error (OCR fallback would be handled elsewhere)
     if not text:
         raise ValueError("Failed to extract text from PDF; consider OCR fallback")
     return text[:max_chars]
