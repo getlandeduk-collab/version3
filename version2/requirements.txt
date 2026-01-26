@@ -1,0 +1,61 @@
+# Web Framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart
+
+# HTTP & Web Scraping
+requests>=2.32.5,<3.0.0
+beautifulsoup4==4.12.3
+lxml==5.3.0
+firecrawl-py
+
+# Data Processing & Validation
+pydantic>=2.10.3,<3.0.0
+pandas>=2.0.0
+numpy==2.1.1
+
+# Matching & ML
+sentence-transformers==3.0.1
+scikit-learn>=1.3.0,<1.6.0; python_version<"3.14"  # Use compatible version (Python 3.14 may need pre-built wheels)
+scikit-learn>=1.3.0; python_version>="3.14"  # For Python 3.14+, try latest with wheels
+tabulate==0.9.0
+
+# Browser Automation (Optional fallback)
+selenium==4.24.0
+webdriver-manager==4.0.2
+playwright==1.48.0
+
+# PDF/OCR
+pdfplumber==0.11.4
+
+# LangGraph & LangChain (AI Agents)
+langgraph>=1.0.0,<2.0.0  # Updated to v1.x for compatibility
+langchain>=1.0.0,<2.0.0  # Updated to v1.x for compatibility
+langchain-openai>=1.0.0,<2.0.0  # Updated to v1.x for OpenAI v2 compatibility
+langchain-community>=0.4.0,<2.0.0  # Updated for langchain-core v1.x compatibility
+langchain-core>=1.2.0,<2.0.0  # Updated to v1.x for compatibility
+typing-extensions>=4.8.0
+
+# OpenAI
+openai>=2.0.0,<3.0.0  # Updated to v2 for httpx compatibility
+
+# Google Gemini (try new package first, fallback to deprecated one)
+google-genai>=0.2.0
+google-generativeai>=0.8.0  # Fallback for compatibility
+
+# Utilities
+python-dotenv>=1.0.1
+pyngrok==7.2.3
+pytz==2024.1
+markdownify>=0.11.6  # HTML to Markdown conversion
+
+# Firebase
+firebase-admin==6.6.0
+
+# Sponsorship Matching
+fuzzywuzzy>=0.18.0
+python-Levenshtein>=0.21.0
+
+# Optional: Graph Visualization (for debugging)
+# networkx>=3.0
+# matplotlib>=3.7.0
